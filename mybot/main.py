@@ -16,16 +16,16 @@ DEBUG = False
 SECRET_KEY = 0b10101010101010101010101010101010  # From main_6.py
 
 # Phase-Shifted Economy rules from main_6.py (Split only before round 100)
-SPLIT_UNTIL = 100 
+SPLIT_UNTIL = 120 
 SPLIT_AT = 6 
 CHILD_SIZE = 3
-MAX_UNITS = 64
+MAX_UNITS = 32
 
 # Movement & Heuristic Weights
 PEARL_W = 60.0
 MEMORY_PEARL_W = 21.0
-SPAWN_W = 14.0
-SPAWN_HORIZON = 12
+SPAWN_W = 10.0
+SPAWN_HORIZON = 4
 SEARCH_NODES = 220
 SPACE_MARGIN = 10
 SPACE_CAP = 100
@@ -58,19 +58,41 @@ ENDGAME_SPACE_MULT = 2.0
 ENDGAME_PORTAL_PEN = 40.0
 
 # ==========================================
-# SONAR COMMUNICATION (From main_6.py)
+# UPGRADED SONAR PROTOCOL
 # ==========================================
+# Payload structure: [8 bits X] [8 bits Y] [8 bits Type] [8 bits Signature]
+SONAR_SIG = 0xAA
+MSG_PEARL = 1
+MSG_THREAT = 2
+
 def process_sonar() -> None:
+    """Reads decrypts broadcasts and injects them directly into V3 memory arrays."""
+    rnd = game.get_round_num()
+    
     for msg in ct.get_sonar_messages():
         decrypted = msg ^ SECRET_KEY
-        if (decrypted & 0xFFFF) == 0xFFFF:
+        
+        # Verify our unique team signature byte
+        if (decrypted & 0xFF) == SONAR_SIG:
             x = (decrypted >> 24) & 0xFF
             y = (decrypted >> 16) & 0xFF
-            ct.output_log(f"Secure transmission received: target {x}, {y}")
+            msg_type = (decrypted >> 8) & 0xFF
+            
+            # Convert 2D coordinates into V3's 1D index
+            idx = y * WID + x
+            
+            if msg_type == MSG_PEARL:
+                # Inject a phantom pearl into the local memory
+                pearls[idx] = rnd
+                seen_round[idx] = rnd
+                
+            elif msg_type == MSG_THREAT:
+                # Treat the coordinate as a highly dangerous obstacle for 5 rounds
+                others[idx] = rnd + 3 
 
-def send_encrypted_sonar(target_x: int, target_y: int) -> None:
-    signature = 0xFFFF
-    message = (target_x << 24) | (target_y << 16) | signature
+def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int) -> None:
+    """Packs coordinates and a message type into a 32-bit integer for broadcast."""
+    message = (target_x << 24) | (target_y << 16) | (msg_type << 8) | SONAR_SIG
     encrypted = message ^ SECRET_KEY
     ct.send_sonar(encrypted)
 
@@ -348,6 +370,8 @@ def hunt_prey(length, units, rnd):
         maxlen = HUNT_ENDGAME_LEN
     if length > maxlen:
         return (), (), ()
+
+    me = ct.get_id()
     fill = HUNT_WINDOW_FRAC * 49.0
     prey, ids, inter = set(), set(), set()
     for hidx, (enemy, eid, hd) in heads.items():
@@ -363,6 +387,14 @@ def hunt_prey(length, units, rnd):
         j = step(hidx, hd)
         if j >= 0:
             inter.add(j)
+
+        # ID CHECK: Only step on current head tile if enemy has ALREADY moved
+        if eid < me:
+            prey.add(hidx)
+        else:
+            # Enemy moves after us; step onto their destination to force head-to-head
+            if j >= 0:
+                prey.add(j)
     return prey, ids, inter
 
 def corridor_pen(j, head, vacate):
@@ -483,9 +515,13 @@ def execute_turn():
     
     # Restored Emergency Escape Split from main_6.py
     if d is None:
-        if ct.can_split(2) and game.get_round_num() < 350:
-            ct.output_log("Head trapped! Emergency split to reverse direction.")
-            ct.do_split(2)
+        current_len = ct.get_length()
+        escape_size = current_len - 2
+        
+        # Ensure we actually have enough length to perform this sacrifice
+        if escape_size >= 2 and ct.can_split(escape_size):
+            ct.output_log(f"Head doomed! Transferring {escape_size} length to escaping tail.")
+            ct.do_split(escape_size)
             return
         d = any_safe()
         
