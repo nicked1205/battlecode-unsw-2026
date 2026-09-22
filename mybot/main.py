@@ -1,320 +1,515 @@
-import helper as unswbc
-from helper import Direction, EdgeType, Position
-from collections import deque
+"""UNSW Battlecode bot - Unified V3 with main_6.py Logic."""
 import random
+from collections import deque
+
+import helper as unswbc
+from helper import Direction, EdgeType
 
 ct: unswbc.Controller
 game: unswbc.Game
 
-# A shared 32-bit key to XOR against Sonar messages to prevent enemy interception
-SECRET_KEY = 0b10101010101010101010101010101010 
+DEBUG = False
 
-# Global memory to track pearl spawn timers across out-of-vision tiles
-known_pearl_timers: dict[tuple[int, int], int] = {}
+# ==========================================
+# TUNABLE WEIGHTS & MAIN_6.PY SECRETS
+# ==========================================
+SECRET_KEY = 0b10101010101010101010101010101010  # From main_6.py
 
+# Phase-Shifted Economy rules from main_6.py (Split only before round 100)
+SPLIT_UNTIL = 100 
+SPLIT_AT = 6 
+CHILD_SIZE = 3
+MAX_UNITS = 64
+
+# Movement & Heuristic Weights
+PEARL_W = 60.0
+MEMORY_PEARL_W = 21.0
+SPAWN_W = 14.0
+SPAWN_HORIZON = 12
+SEARCH_NODES = 220
+SPACE_MARGIN = 10
+SPACE_CAP = 100
+TRAP_PEN = 6.0
+PORTAL_PEN = 8.0
+PORTAL_STALE_PEN = 25.0
+HEAD_RISK = 28.0
+TEAM_CUT_PEN = 20.0
+TEAM_NEAR_PEN = 1.5
+PORTAL_UNKNOWN_PEN = 120.0
+LETHAL_PEN = 100.0
+VISIT_PEN = 2.8
+EXPLORE_W = 8.4
+STRAIGHT_BONUS = 0.5
+OTHER_TTL = 2
+VACATE_MARGIN = 1
+HUNT_ENABLE = 1
+HUNT_MAX_LEN = 5
+HUNT_MIN_UNITS = 3
+HUNT_MIN_ENEMY_SEGS = 8
+HUNT_WINDOW_FRAC = 0.3
+HUNT_KILL_W = 1000.0
+HUNT_W = 25.0
+HUNT_ADJ_W = 8.0
+HUNT_ENDGAME_LEN = 3
+CORRIDOR_PEN = 8.0
+CORRIDOR_MIN = 2
+ENDGAME_ROUND = 400
+ENDGAME_SPACE_MULT = 2.0
+ENDGAME_PORTAL_PEN = 40.0
+
+# ==========================================
+# SONAR COMMUNICATION (From main_6.py)
+# ==========================================
 def process_sonar() -> None:
-    """Reads and decrypts all incoming sonar broadcasts from the current turn."""
     for msg in ct.get_sonar_messages():
         decrypted = msg ^ SECRET_KEY
-        
-        # Verify the signature to ensure it's from our team, not enemy noise
         if (decrypted & 0xFFFF) == 0xFFFF:
             x = (decrypted >> 24) & 0xFF
             y = (decrypted >> 16) & 0xFF
             ct.output_log(f"Secure transmission received: target {x}, {y}")
 
 def send_encrypted_sonar(target_x: int, target_y: int) -> None:
-    """Packs coordinates into a 32-bit integer, encrypts it, and broadcasts it."""
     signature = 0xFFFF
     message = (target_x << 24) | (target_y << 16) | signature
-    
     encrypted = message ^ SECRET_KEY
     ct.send_sonar(encrypted)
 
-def is_safe(direction: Direction) -> bool:
-    """Checks the immediate adjacent edge and destination tile for fatal obstacles."""
-    here = ct.get_position()
-    tile = ct.get_tile(here)
-    
-    if tile is None: 
+# ==========================================
+# V3 1D PATHFINDING ENGINE
+# ==========================================
+DIRS = Direction.get_direction_list()
+N, E, S, W = 0, 1, 2, 3
+DIR_OF = {d: i for i, d in enumerate(DIRS)}
+rng = random.Random()
+
+WID = HEI = 0
+hedge = []
+vedge = []
+portal_of = {}
+portal_ends = {}
+seen_round = []
+ptime = []
+pearls = {}
+others = {}          
+heads = {}           
+seg_count = {}       
+mates_near = set()   
+visits = {}
+traj = []
+LAST_ROW = 0
+
+def setup():
+    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW
+    WID, HEI = game.get_map_size()
+    n = WID * HEI
+    LAST_ROW = (HEI - 1) * WID
+    hedge = [0] * n
+    vedge = [0] * n
+    seen_round = [-1] * n
+    ptime = [-1] * n
+
+def nb(idx, d):
+    if d == 0: return idx - WID if idx >= WID else idx + LAST_ROW
+    if d == 2: return idx + WID if idx < LAST_ROW else idx - LAST_ROW
+    if d == 1:
+        j = idx + 1
+        return j if j % WID else j - WID
+    return idx - 1 if idx % WID else idx - 1 + WID
+
+def edge_key(idx, d):
+    if d == N: return "h", idx
+    if d == S: return "h", nb(idx, S)
+    if d == W: return "v", idx
+    return "v", nb(idx, E)
+
+def step(idx, d):
+    k, i = edge_key(idx, d)
+    st = hedge[i] if k == "h" else vedge[i]
+    if st == 0: return nb(idx, d)
+    if st == 1: return -1
+    ends = portal_ends.get(portal_of.get((k, i)), ())
+    far = None
+    for e in ends:
+        if e != (k, i): far = e
+    if far is None: return -2
+    fi = far[1]
+    return fi if (d == S or d == E) else nb(fi, d)
+
+def portal_exit(idx, d):
+    k, i = edge_key(idx, d)
+    ends = portal_ends.get(portal_of.get((k, i)), ())
+    for e in ends:
+        if e != (k, i):
+            return e[1] if (d == S or d == E) else nb(e[1], d)
+    return -2
+
+def nbrs(idx):
+    out = []
+    e = hedge[idx]
+    if e == 0: out.append(idx - WID if idx >= WID else idx + LAST_ROW)
+    elif e == 2:
+        j = portal_exit(idx, 0)
+        if j >= 0: out.append(j)
+    j2 = idx + WID if idx < LAST_ROW else idx - LAST_ROW
+    e = hedge[j2]
+    if e == 0: out.append(j2)
+    elif e == 2:
+        j = portal_exit(idx, 2)
+        if j >= 0: out.append(j)
+    j2 = idx + 1
+    if not j2 % WID: j2 -= WID
+    e = vedge[j2]
+    if e == 0: out.append(j2)
+    elif e == 2:
+        j = portal_exit(idx, 1)
+        if j >= 0: out.append(j)
+    e = vedge[idx]
+    if e == 0: out.append(idx - 1 if idx % WID else idx - 1 + WID)
+    elif e == 2:
+        j = portal_exit(idx, 3)
+        if j >= 0: out.append(j)
+    return out
+
+def observe():
+    rnd = game.get_round_num()
+    me = ct.get_id()
+    my_team = ct.get_team()
+    heads.clear()
+    seg_count.clear()
+    mates_near.clear()
+    for t in ct.get_tiles():
+        p = t.get_position()
+        idx = p.y * WID + p.x
+        seen_round[idx] = rnd
+        ptime[idx] = t.get_pearl_time()
+        if t.has_pearl():
+            pearls[idx] = rnd
+        else:
+            pearls.pop(idx, None)
+        part = t.get_dragon()
+        if part is not None and part.get_id() != me:
+            others[idx] = rnd
+            pid = part.get_id()
+            seg_count[pid] = seg_count.get(pid, 0) + 1
+            enemy = part.get_team() != my_team
+            if not enemy:
+                mates_near.add(idx)
+            if part.is_head():
+                heads[idx] = (enemy, pid, DIR_OF[part.get_dir()])
+        elif idx in others:
+            del others[idx]
+        edges = t._edges
+        for d in range(4):
+            e = edges[d]
+            et = e.edge_type
+            if et == EdgeType.EMPTY:
+                continue
+            k, i = edge_key(idx, d)
+            arr = hedge if k == "h" else vedge
+            if et == EdgeType.KELP:
+                arr[i] = 1
+            else:
+                arr[i] = 2
+                pid = e.portal_id
+                portal_of[(k, i)] = pid
+                ends = portal_ends.setdefault(pid, [])
+                if (k, i) not in ends:
+                    ends.append((k, i))
+
+def build_blockers():
+    rnd = game.get_round_num()
+    L = ct.get_length()
+    me = ct.get_id()
+    body = traj[-L:]
+    vacate = {}
+    for k, idx in enumerate(body):
+        vacate[idx] = k + 2 + VACATE_MARGIN
+    tail_known = len(body) == L
+    blocked = set()
+    if not tail_known:
+        for t in ct.get_tiles():
+            part = t.get_dragon()
+            if part is not None and part.get_id() == me:
+                p = t.get_position()
+                i = p.y * WID + p.x
+                if i not in vacate:
+                    blocked.add(i)
+        vacate = {i: v + (L - len(body)) for i, v in vacate.items()}
+    for i in blocked:
+        vacate[i] = 1 << 30
+    for idx, r in others.items():
+        if rnd - r <= OTHER_TTL:
+            blocked.add(idx)
+            vacate[idx] = 1 << 30
+    return blocked, vacate
+
+def passable(j, depth, blocked, vacate):
+    return j >= 0 and depth >= vacate.get(j, 0)
+
+def room(start, extra_blocked, vacate, need):
+    seen = {start}
+    seen.update(extra_blocked)
+    q = deque([(start, 1)])
+    count = 0
+    pop = q.popleft
+    push = q.append
+    get = vacate.get
+    while q:
+        idx, depth = pop()
+        count += 1
+        if count >= need:
+            return count
+        depth += 1
+        for j in nbrs(idx):
+            if j in seen or depth < get(j, 0):
+                continue
+            seen.add(j)
+            push((j, depth))
+    return count
+
+def search(head, blocked, vacate, targets=()):
+    rnd = game.get_round_num()
+    best = [0.0] * 4
+    unknown = [0] * 4
+    tdist = [1 << 20] * 4
+    seen = {head}
+    q = deque()
+    for d in range(4):
+        j = step(head, d)
+        if j in seen or not passable(j, 1, blocked, vacate):
+            continue
+        seen.add(j)
+        q.append((j, d, 1))
+    expanded = 0
+    pop = q.popleft
+    push = q.append
+    get = vacate.get
+    while q and expanded < SEARCH_NODES:
+        idx, first, dist = pop()
+        expanded += 1
+        if idx in targets and dist < tdist[first]:
+            tdist[first] = dist
+        sr = seen_round[idx]
+        if sr < 0:
+            unknown[first] += 1
+        else:
+            pr = pearls.get(idx)
+            if pr is not None:
+                v = (PEARL_W if pr == rnd else MEMORY_PEARL_W) / (1 + dist)
+                if v > best[first]:
+                    best[first] = v
+            pt = ptime[idx]
+            if pt >= 0:
+                pred = pt - (rnd - sr)
+                if 0 <= pred <= SPAWN_HORIZON:
+                    v = SPAWN_W / (1 + max(pred, dist))
+                    if v > best[first]:
+                        best[first] = v
+        nd = dist + 1
+        for j in nbrs(idx):
+            if j in seen or nd < get(j, 0):
+                continue
+            seen.add(j)
+            push((j, first, nd))
+    return best, unknown, tdist
+
+def head_threats(idx):
+    out = []
+    for d in range(4):
+        j = step(idx, d)
+        if j >= 0 and j in heads:
+            out.append(heads[j])
+    return out
+
+def ahead_tiles(want_enemy):
+    out = set()
+    for hidx, (enemy, _, hd) in heads.items():
+        if enemy != want_enemy:
+            continue
+        j = step(hidx, hd)
+        if j >= 0:
+            out.add(j)
+            j2 = step(j, hd)
+            if j2 >= 0:
+                out.add(j2)
+    return out
+
+def around_heads():
+    out = set()
+    for hidx in heads:
+        out.update(nbrs(hidx))
+    return out
+
+def hunt_prey(length, units, rnd):
+    if not HUNT_ENABLE or not heads or units < HUNT_MIN_UNITS or units < 2:
+        return (), (), ()
+    maxlen = HUNT_MAX_LEN
+    if rnd >= ENDGAME_ROUND and HUNT_ENDGAME_LEN < maxlen:
+        maxlen = HUNT_ENDGAME_LEN
+    if length > maxlen:
+        return (), (), ()
+    fill = HUNT_WINDOW_FRAC * 49.0
+    prey, ids, inter = set(), set(), set()
+    for hidx, (enemy, eid, hd) in heads.items():
+        if not enemy:
+            continue
+        segs = seg_count.get(eid, 0)
+        if segs <= length:
+            continue
+        if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
+            continue
+        prey.add(hidx)
+        ids.add(eid)
+        j = step(hidx, hd)
+        if j >= 0:
+            inter.add(j)
+    return prey, ids, inter
+
+def corridor_pen(j, head, vacate):
+    free = 0
+    get = vacate.get
+    for k in nbrs(j):
+        if k != head and 2 >= get(k, 0):
+            free += 1
+    return CORRIDOR_PEN * (CORRIDOR_MIN - free) if free < CORRIDOR_MIN else 0.0
+
+def mates_within2(idx):
+    n = 0
+    x, y = idx % WID, idx // WID
+    for m in mates_near:
+        mx, my = m % WID, m // WID
+        dx = min((mx - x) % WID, (x - mx) % WID)
+        dy = min((my - y) % HEI, (y - my) % HEI)
+        if dx <= 2 and dy <= 2:
+            n += 1
+    return n
+
+def choose():
+    head = traj[-1]
+    length = ct.get_length()
+    units = ct.get_unit_count()
+    facing = DIR_OF[ct.get_dir()]
+    blocked, vacate = build_blockers()
+    rnd = game.get_round_num()
+    endgame = rnd >= ENDGAME_ROUND
+    margin = SPACE_MARGIN * ENDGAME_SPACE_MULT if endgame else SPACE_MARGIN
+    need = min(int(2 * length + margin), SPACE_CAP)
+    prey, prey_ids, intercepts = hunt_prey(length, units, rnd)
+    pearl_val, unknown, hunt_dist = search(head, blocked, vacate, intercepts)
+    cut = ahead_tiles(False)
+    pessimistic = cut | ahead_tiles(True) | around_heads()
+
+    best_d, best_s = None, -1e18
+    for d in range(4):
+        j = step(head, d)
+        if j == -1:
+            continue
+        if j == -2:
+            s = -PORTAL_UNKNOWN_PEN + rng.random()
+            if endgame: s -= ENDGAME_PORTAL_PEN
+        elif j in prey:
+            s = HUNT_KILL_W + rng.random()
+        else:
+            if not passable(j, 1, blocked, vacate):
+                continue
+            s = pearl_val[d]
+            if j != nb(head, d):
+                s -= PORTAL_PEN
+                if endgame: s -= ENDGAME_PORTAL_PEN
+                if seen_round[j] < rnd - 2: s -= PORTAL_STALE_PEN
+            s -= corridor_pen(j, head, vacate)
+            if prey_ids and hunt_dist[d] < (1 << 20):
+                s += HUNT_W / (1.0 + hunt_dist[d])
+            r = room(j, pessimistic, vacate, need)
+            if r < need:
+                s -= (need - r) * TRAP_PEN
+                if r < length + 2:
+                    s -= LETHAL_PEN
+            for enemy, eid, _ in head_threats(j):
+                if enemy and eid in prey_ids:
+                    s += HUNT_ADJ_W
+                else:
+                    s -= HEAD_RISK
+            if j in cut: s -= TEAM_CUT_PEN
+            if mates_near: s -= TEAM_NEAR_PEN * mates_within2(j)
+            s += EXPLORE_W * unknown[d] / SEARCH_NODES
+            s -= VISIT_PEN * visits.get(j, 0)
+            if d == facing: s += STRAIGHT_BONUS
+            s += rng.random() * 0.3
+        
+        if s > best_s:
+            best_s, best_d = s, d
+    return best_d
+
+def maybe_split():
+    rnd = game.get_round_num()
+    if rnd > SPLIT_UNTIL or rnd >= ENDGAME_ROUND:
         return False
-        
-    # Check for lethal Kelp edges
-    edge = tile.get_edge(direction)
-    if edge.get_edge_type() == EdgeType.KELP:
+    if ct.get_length() < SPLIT_AT or ct.get_unit_count() >= MAX_UNITS:
         return False
-        
-    # Check destination tile for other dragon bodies (including self)
-    ahead = ct.get_tile(here.add_dir(direction))
-    if ahead is None or ahead.get_dragon() is not None:
-        return False 
-        
+    if not ct.can_split(CHILD_SIZE):
+        return False
+    ct.do_split(CHILD_SIZE)
     return True
 
-def is_enemy_threat_nearby(target_pos: Position) -> bool:
-    """
-    Scans the entire vision grid for enemy heads that could sprint into our target.
-    Higher ID enemies have not moved yet and require a larger safety buffer.
-    """
-    my_team = ct.get_team()
-    my_id = ct.get_id()
-    width, height = game.get_map_size()
+def any_safe():
+    head = traj[-1]
+    blocked, vacate = build_blockers()
+    for d in range(4):
+        if passable(step(head, d), 1, blocked, vacate):
+            return d
+    for d in range(4):
+        if step(head, d) == -2:
+            return d
+    return DIR_OF[ct.get_dir()]
+
+# ==========================================
+# UNIFIED EXECUTION SEQUENCE
+# ==========================================
+def execute_turn():
+    p = ct.get_position()
+    head = p.y * WID + p.x
+    if not traj or traj[-1] != head:
+        traj.append(head)
+        visits[head] = visits.get(head, 0) + 1
+        
+    observe()
+    process_sonar()  # Restored from main_6.py
     
-    for tile in ct.get_tiles():
-        part = tile.get_dragon()
-        
-        # We only care about enemy heads
-        if part is not None and part.is_head() and part.get_team() != my_team:
-            enemy_pos = tile.get_position()
-            enemy_id = part.get_id()
-            
-            # Calculate the shortest Manhattan distance, accounting for map wrap-around
-            dx = min(abs(target_pos.x - enemy_pos.x), width - abs(target_pos.x - enemy_pos.x))
-            dy = min(abs(target_pos.y - enemy_pos.y), height - abs(target_pos.y - enemy_pos.y))
-            distance = dx + dy
-            
-            # If the enemy hasn't moved yet (higher ID), they could sprint into us.
-            # A safety buffer of 2 tiles prevents most accidental sprint collisions.
-            if enemy_id > my_id and distance <= 2:
-                return True
-                
-            # If they have already moved (lower ID), their position is static for this round,
-            # so they are only a threat if they are already standing on the exact target tile.
-            if enemy_id < my_id and distance == 0:
-                return True
-                
-    return False
-
-# ====================== PEARL TARGETING =========================
-
-def find_best_pearl_target() -> tuple[list[Direction], int]:
-    """
-    Uses BFS to find reachable pearls, heavily prioritizing actual existing pearls 
-    over future timer spawns to prevent camping.
-    """
-    start_pos = ct.get_position()
-    queue = deque([(start_pos, [])])
-    visited = {start_pos}
-    targets = []
-    
-    while queue:
-        current_pos, path = queue.popleft()
-        
-        if len(path) > 6:
-            continue
-            
-        current_tile = ct.get_tile(current_pos)
-        if current_tile is None:
-            continue
-            
-        pearl_time = current_tile.get_pearl_time()
-        has_pearl = current_tile.has_pearl()
-        
-        # We focus primarily on actual pearls, or very immediate spawns (timer == 0)
-        if len(path) > 0 and (has_pearl or pearl_time == 0):
-            # Existing pearls get priority 0, timer 0 gets priority 1
-            priority = 0 if has_pearl else 1
-            targets.append({
-                "path": path,
-                "priority": priority,
-                "yield": 1
-            })
-            
-        for direction in Direction.get_direction_list():
-            edge = current_tile.get_edge(direction)
-            if edge.get_edge_type() == EdgeType.KELP:
-                continue
-                
-            next_pos = current_pos.add_dir(direction)
-            
-            if next_pos not in visited:
-                next_tile = ct.get_tile(next_pos)
-                
-                if next_tile is not None and next_tile.get_dragon() is None:
-                    if not is_enemy_threat_nearby(next_pos):
-                        visited.add(next_pos)
-                        queue.append((next_pos, path + [direction]))
-                    
-    if not targets:
-        return [], 0
-        
-    # Sort by priority (real pearls first) then shortest path
-    targets.sort(key=lambda t: (t["priority"], len(t["path"])))
-    best_target = targets[0]
-    return best_target["path"], best_target["yield"]
-
-
-def update_pearl_memory() -> None:
-    """Scans current vision, remembers spawns, and clears targets if they were eaten."""
-    current_round = game.get_round_num()
-    
-    for tile in ct.get_tiles():
-        pos = tile.get_position()
-        p_time = tile.get_pearl_time()
-        pos_tuple = (pos.x, pos.y)
-        
-        if tile.has_pearl():
-            known_pearl_timers[pos_tuple] = current_round - 1
-        elif p_time == 0:
-            known_pearl_timers[pos_tuple] = current_round
-        elif p_time > 0:
-            known_pearl_timers[pos_tuple] = current_round + p_time
-        
-        # If we are standing on or looking at a known target tile and it has no pearl and no countdown, clear it!
-        if pos_tuple in known_pearl_timers and not tile.has_pearl() and p_time < 0:
-            del known_pearl_timers[pos_tuple]
-
-
-def get_best_global_target() -> tuple[int, int] | None:
-    """Finds the best global pearl, ignoring future timers to prevent circling empty tiles."""
-    if not known_pearl_timers:
-        return None
-        
-    current_round = game.get_round_num()
-    here = ct.get_position()
-    width, height = game.get_map_size()
-    
-    best_target = None
-    best_score = float('inf')
-    
-    # Clean up expired entries first
-    expired = [pos for pos, spawn_round in known_pearl_timers.items() if spawn_round < current_round - 5]
-    for pos in expired:
-        del known_pearl_timers[pos]
-        
-    for (px, py), spawn_round in known_pearl_timers.items():
-        # Calculate wrapped Manhattan distance
-        dx = min(abs(here.x - px), width - abs(here.x - px))
-        dy = min(abs(here.y - py), height - abs(here.y - py))
-        distance = dx + dy
-        
-        time_to_spawn = spawn_round - current_round
-        
-        # Ignore pearls that are far in the future; only target things ready now or in 1-2 rounds
-        if time_to_spawn > 2:
-            continue
-            
-        score = (time_to_spawn * 5) + distance
-        
-        if score < best_score:
-            best_score = score
-            best_target = (px, py)
-            
-    return best_target
-
-def move_towards_target(target_x: int, target_y: int) -> bool:
-    """Attempts to move one step closer to a global target coordinate."""
-    here = ct.get_position()
-    width, height = game.get_map_size()
-    
-    # Determine the optimal directions to close the distance considering wrap-around
-    desired_dirs = []
-    
-    dx = target_x - here.x
-    wrapped_dx = width - abs(dx)
-    if dx != 0:
-        if (dx > 0 and abs(dx) <= wrapped_dx) or (dx < 0 and abs(dx) > wrapped_dx):
-            desired_dirs.append(Direction.EAST)
-        else:
-            desired_dirs.append(Direction.WEST)
-            
-    dy = target_y - here.y
-    wrapped_dy = height - abs(dy)
-    if dy != 0:
-        if (dy > 0 and abs(dy) <= wrapped_dy) or (dy < 0 and abs(dy) > wrapped_dy):
-            desired_dirs.append(Direction.SOUTH)
-        else:
-            desired_dirs.append(Direction.NORTH)
-            
-    # Try the most direct routes first
-    for direction in desired_dirs:
-        if is_safe(direction):
-            ct.output_log(f"Routing toward known pearl at {target_x}, {target_y}")
-            ct.make_move(direction)
-            return True
-            
-    return False
-
-# ====================== MAIN TURN EXECUTION =========================
-
-def execute_turn() -> None:
-    """The main decision-making sequence executed by every living dragon, every turn."""
-    # 1. Update Global Memory
-    update_pearl_memory()
-    
-    # 2. Process Intelligence
-    process_sonar()
-    
-    # 3. Macro Economy Expansion (Phase-Shifted)
-    # We only allow splitting in the first 100 rounds to build our swarm.
-    if game.get_round_num() < 100:
-        if ct.can_split(3): 
-            ct.output_log("Splitting to expand economy")
-            ct.do_split(3)
-            return
-
-    # 4. Local Pearl Hunting (Single-Step BFS)
-    # This reintroduces the search for pearls up to 6 steps away, but only executes a single safe step.
-    target_path, expected_yield = find_best_pearl_target()
-    if len(target_path) > 0:
-        ct.output_log("Marching toward nearby pearl")
-        ct.make_move(target_path[0])
+    if maybe_split():
         return
-
-    # 5. Global Navigation Fallback (Out-of-Vision Pearls)
-    best_global = get_best_global_target()
-    if best_global is not None:
-        if move_towards_target(best_global[0], best_global[1]):
-            return
-            
-    # 6. Momentum-Based Exploration (Prevents Circling)
-    here = ct.get_position()
-    safe_dirs = []
-    
-    for direction in Direction.get_direction_list():
-        if is_safe(direction):
-            safe_dirs.append(direction)
-            
-    if safe_dirs:
-        current_facing = ct.get_dir()
-        # We filter out the exact opposite direction to prevent the dragon from pacing back and forth
-        forward_dirs = [d for d in safe_dirs if d != current_facing.get_opposite()]
         
-        if forward_dirs:
-            ct.output_log("Exploring forward")
-            ct.make_move(random.choice(forward_dirs))
-        else:
-            ct.output_log("Dead end reached, turning around")
-            ct.make_move(random.choice(safe_dirs))
-        return
-
-    # 7. Emergency Escape Split
-    # If safe_dirs is completely empty, the head is trapped. We split to let the tail escape.
-    if ct.can_split(2):
-        ct.output_log("Head trapped! Emergency split to reverse direction.")
-        # Splitting a size of 2 drops the tail as a new dragon, keeping the parent alive for one more turn
-        ct.do_split(2)
-        return
-
-    # 8. Absolute Last Resort
-    # If we cannot move or split, we try to output any valid move to avoid a crash penalty
-    for direction in Direction.get_direction_list():
-        if ct.get_tile(here).get_edge(direction).get_edge_type() != EdgeType.KELP:
-            ct.make_move(direction)
+    d = choose()
+    
+    # Restored Emergency Escape Split from main_6.py
+    if d is None:
+        if ct.can_split(2) and game.get_round_num() < 350:
+            ct.output_log("Head trapped! Emergency split to reverse direction.")
+            ct.do_split(2)
             return
-            
-    ct.make_move(Direction.NORTH)
+        d = any_safe()
+        
+    ct.make_move(DIRS[d])
 
-def main() -> None:
-    """Initializes the game state and loops through turns until elimination."""
+def main():
     global ct, game
-    # Seed so we get the same random generator every time.
-    random.seed(0)
-    
     ct, game = unswbc.init()
-
-    while unswbc.update(ct, game):
-        execute_turn()
+    setup()
+    rng.seed(ct.get_id() * 7919 + 17)
+    while True:
+        try:
+            if not unswbc.update(ct, game):
+                break
+        except EOFError:
+            break
+        try:
+            execute_turn()
+        except Exception as exc:
+            if not traj:
+                p = ct.get_position()
+                traj.append(p.y * WID + p.x)
+            ct.output_log("error:", repr(exc))
+            ct.make_move(DIRS[any_safe()])
         unswbc.end_turn()
 
 if __name__ == "__main__":
