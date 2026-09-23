@@ -27,9 +27,9 @@ MIN_PEARL_CLUSTER = 3
 # Movement & Heuristic Weights
 PEARL_W = 60.0
 MEMORY_PEARL_W = 21.0
-SPAWN_W = 25.0
+SPAWN_W = 40.0
 SPAWN_HORIZON = 40
-SEARCH_NODES = 220
+SEARCH_NODES = 300
 SPACE_MARGIN = 10
 SPACE_CAP = 100
 TRAP_PEN = 6.0
@@ -39,6 +39,7 @@ HEAD_RISK = 28.0
 TEAM_CUT_PEN = 20.0
 TEAM_NEAR_PEN = 1.5
 PORTAL_UNKNOWN_PEN = 100.0
+PORTAL_SCOUT_MULT = 0.6
 LETHAL_PEN = 100.0
 VISIT_PEN = 2.8
 EXPLORE_W = 8.4
@@ -323,11 +324,24 @@ def search(head, blocked, vacate, targets=()):
     pop = q.popleft
     push = q.append
     get = vacate.get
+
+    # Pre-calculate early-game portal gravity (Massive pull before round 50)
+    curiosity_pull = (PEARL_W * PORTAL_SCOUT_MULT) if rnd < 50 else 0
+
     while q and expanded < SEARCH_NODES:
         idx, first, dist = pop()
         expanded += 1
         if idx in targets and dist < tdist[first]:
             tdist[first] = dist
+
+        # DISTANT PORTAL GRAVITY: Pull scouts toward portals before round 50
+        if curiosity_pull > 0:
+            for pd in range(4):
+                if step(idx, pd) == -2:
+                    v = curiosity_pull / (1 + dist)
+                    if v > best[first]:
+                        best[first] = v
+        
         sr = seen_round[idx]
         if sr < 0:
             unknown[first] += 1
@@ -341,7 +355,7 @@ def search(head, blocked, vacate, targets=()):
             if pt >= 0:
                 pred = pt - (rnd - sr)
                 if 0 <= pred <= SPAWN_HORIZON:
-                    v = SPAWN_W / (1 + max(pred, dist))
+                    v = SPAWN_W / (1 + dist + (pred * 0.2))
                     if v > best[first]:
                         best[first] = v
         nd = dist + 1
@@ -476,13 +490,16 @@ def choose():
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
 
-    # Early-Game Fan Out OR Hub Crowd Control
-    if rnd < 20:
-        dynamic_team_pen = TEAM_NEAR_PEN * 5.0
-    else:
-        # If 3 or more teammates are loitering in the same area, aggressively push them apart
-        # This prevents collateral crashes while camping hubs
-        dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
+    # Early-Game Fan Out: Severely penalize moving near teammates to force maximum map exploration
+    dynamic_team_pen = TEAM_NEAR_PEN * 5.0 if rnd < 40 else TEAM_NEAR_PEN
+
+    # # Early-Game Fan Out OR Hub Crowd Control
+    # if rnd < 30:
+    #     dynamic_team_pen = TEAM_NEAR_PEN * 5.0
+    # else:
+    #     # If 3 or more teammates are loitering in the same area, aggressively push them apart
+    #     # This prevents collateral crashes while camping hubs
+    #     dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
 
     best_d, best_s = None, -1e18
     for d in range(4):
@@ -490,15 +507,16 @@ def choose():
         if j == -1:
             continue
         if j == -2:
-            # Active Exploration Bonus: Treat unknown portals as high-value targets before round 50
+            # Extreme Curiosity: A blind portal must explicitly outscore an adjacent pearl
             if rnd < 50:
-                s = (EXPLORE_W * 2.0) + rng.random()
+                s = (PEARL_W * PORTAL_SCOUT_MULT) + rng.random()
             else:
                 # Gradual Paranoia: Ramp up the penalty steadily from round 50 to 250
                 curiosity_factor = min((rnd - 50) / 200.0, 1.0) 
                 s = -(PORTAL_UNKNOWN_PEN * curiosity_factor) + rng.random()
                 
             if endgame: s -= ENDGAME_PORTAL_PEN
+
         elif j in prey:
             s = HUNT_KILL_W + rng.random()
         else:
