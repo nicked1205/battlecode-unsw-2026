@@ -16,16 +16,19 @@ DEBUG = False
 SECRET_KEY = 0b10101010101010101010101010101010  # From main_6.py
 
 # Phase-Shifted Economy rules from main_6.py (Split only before round 100)
-SPLIT_UNTIL = 120 
-SPLIT_AT = 6 
-CHILD_SIZE = 3
-MAX_UNITS = 32
+SPLIT_UNTIL = 250 
+SPLIT_AT = 4 
+CHILD_SIZE = 2
+MAX_UNITS = 64
+
+# Sonar
+MIN_PEARL_CLUSTER = 3
 
 # Movement & Heuristic Weights
 PEARL_W = 60.0
 MEMORY_PEARL_W = 21.0
-SPAWN_W = 10.0
-SPAWN_HORIZON = 4
+SPAWN_W = 14.0
+SPAWN_HORIZON = 12
 SEARCH_NODES = 220
 SPACE_MARGIN = 10
 SPACE_CAP = 100
@@ -35,7 +38,7 @@ PORTAL_STALE_PEN = 25.0
 HEAD_RISK = 28.0
 TEAM_CUT_PEN = 20.0
 TEAM_NEAR_PEN = 1.5
-PORTAL_UNKNOWN_PEN = 120.0
+PORTAL_UNKNOWN_PEN = 100.0
 LETHAL_PEN = 100.0
 VISIT_PEN = 2.8
 EXPLORE_W = 8.4
@@ -199,6 +202,10 @@ def observe():
     heads.clear()
     seg_count.clear()
     mates_near.clear()
+
+    visible_pearls = 0
+    pearl_coords = []
+
     for t in ct.get_tiles():
         p = t.get_position()
         idx = p.y * WID + p.x
@@ -206,6 +213,8 @@ def observe():
         ptime[idx] = t.get_pearl_time()
         if t.has_pearl():
             pearls[idx] = rnd
+            visible_pearls += 1
+            pearl_coords.append((p.x, p.y))
         else:
             pearls.pop(idx, None)
         part = t.get_dragon()
@@ -218,6 +227,9 @@ def observe():
                 mates_near.add(idx)
             if part.is_head():
                 heads[idx] = (enemy, pid, DIR_OF[part.get_dir()])
+                # Warn team if an enemy is significantly larger
+                if enemy and seg_count.get(pid, 0) > ct.get_length() + 8:
+                    send_encrypted_sonar(p.x, p.y, MSG_THREAT)
         elif idx in others:
             del others[idx]
         edges = t._edges
@@ -237,6 +249,11 @@ def observe():
                 ends = portal_ends.setdefault(pid, [])
                 if (k, i) not in ends:
                     ends.append((k, i))
+
+    # Sonar Broadcast: Only ping if we find a cluster, acting as a dinner bell for the swarm
+    if visible_pearls >= MIN_PEARL_CLUSTER and rng.random() < 0.2:
+        # Ping the coordinate of the first pearl in the cluster
+        send_encrypted_sonar(pearl_coords[0][0], pearl_coords[0][1], MSG_PEARL)
 
 def build_blockers():
     rnd = game.get_round_num()
@@ -362,7 +379,7 @@ def around_heads():
         out.update(nbrs(hidx))
     return out
 
-def hunt_prey(length, units, rnd):
+def hunt_prey(length, units, rnd, mates_xy=None):
     if not HUNT_ENABLE or not heads or units < HUNT_MIN_UNITS or units < 2:
         return (), (), ()
     maxlen = HUNT_MAX_LEN
@@ -377,14 +394,32 @@ def hunt_prey(length, units, rnd):
     for hidx, (enemy, eid, hd) in heads.items():
         if not enemy:
             continue
+            
         segs = seg_count.get(eid, 0)
-        if segs <= length:
-            continue
-        if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
-            continue
-        prey.add(hidx)
-        ids.add(eid)
         j = step(hidx, hd)
+        
+        # Bodyguard Check: Is the enemy about to step onto a friendly segment?
+        is_threat_to_team = (j in mates_near)
+        if not is_threat_to_team and mates_xy:
+            ex, ey = hidx % WID, hidx // WID
+            for mx, my in mates_xy:
+                # Wrapped Manhattan distance
+                dx = min(abs(mx - ex), WID - abs(mx - ex))
+                dy = min(abs(my - ey), HEI - abs(my - ey))
+                if (dx + dy) <= 4:
+                    is_threat_to_team = True
+                    break
+        
+        # Standard hunting restrictions are bypassed if a teammate is in immediate danger
+        if not is_threat_to_team:
+            if length > maxlen:
+                continue
+            if segs <= length:
+                continue
+            if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
+                continue
+                
+        ids.add(eid)
         if j >= 0:
             inter.add(j)
 
@@ -392,9 +427,18 @@ def hunt_prey(length, units, rnd):
         if eid < me:
             prey.add(hidx)
         else:
-            # Enemy moves after us; step onto their destination to force head-to-head
+            # Enemy moves after us; step onto their destination to force a crash
             if j >= 0:
                 prey.add(j)
+                
+                # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
+                for flank_dir in range(4):
+                    # Ignore directly ahead and directly behind their facing
+                    if flank_dir != hd and flank_dir != DIR_OF[Direction(DIRS[hd]).get_opposite()]:
+                        flank_tile = step(j, flank_dir)
+                        if flank_tile >= 0:
+                            inter.add(flank_tile)
+
     return prey, ids, inter
 
 def corridor_pen(j, head, vacate):
@@ -426,10 +470,14 @@ def choose():
     endgame = rnd >= ENDGAME_ROUND
     margin = SPACE_MARGIN * ENDGAME_SPACE_MULT if endgame else SPACE_MARGIN
     need = min(int(2 * length + margin), SPACE_CAP)
-    prey, prey_ids, intercepts = hunt_prey(length, units, rnd)
+    mates_xy = [(m % WID, m // WID) for m in mates_near] if mates_near else None
+    prey, prey_ids, intercepts = hunt_prey(length, units, rnd, mates_xy)
     pearl_val, unknown, hunt_dist = search(head, blocked, vacate, intercepts)
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
+
+    # Early-Game Fan Out: Severely penalize moving near teammates to force maximum map exploration
+    dynamic_team_pen = TEAM_NEAR_PEN * 5.0 if rnd < 20 else TEAM_NEAR_PEN
 
     best_d, best_s = None, -1e18
     for d in range(4):
@@ -437,7 +485,9 @@ def choose():
         if j == -1:
             continue
         if j == -2:
-            s = -PORTAL_UNKNOWN_PEN + rng.random()
+            # Dynamic Curiosity: Unknown portals are practically free early game, but heavily penalized late game
+            curiosity_factor = min(rnd / 250.0, 1.0) 
+            s = -(PORTAL_UNKNOWN_PEN * curiosity_factor) + rng.random()
             if endgame: s -= ENDGAME_PORTAL_PEN
         elif j in prey:
             s = HUNT_KILL_W + rng.random()
@@ -445,10 +495,17 @@ def choose():
             if not passable(j, 1, blocked, vacate):
                 continue
             s = pearl_val[d]
+
+            # Portal Traversal Logic
             if j != nb(head, d):
                 s -= PORTAL_PEN
                 if endgame: s -= ENDGAME_PORTAL_PEN
-                if seen_round[j] < rnd - 2: s -= PORTAL_STALE_PEN
+                
+                # Progressive Staleness: The longer it has been since we checked the exit, the riskier it gets
+                staleness = rnd - seen_round[j]
+                if staleness > 2:
+                    # Penalty slowly builds over time up to the maximum stale cap
+                    s -= min(PORTAL_STALE_PEN, staleness * 0.8)
             s -= corridor_pen(j, head, vacate)
             if prey_ids and hunt_dist[d] < (1 << 20):
                 s += HUNT_W / (1.0 + hunt_dist[d])
@@ -457,13 +514,19 @@ def choose():
                 s -= (need - r) * TRAP_PEN
                 if r < length + 2:
                     s -= LETHAL_PEN
+
+            # Emergency Desperation Bypass: If we are stepping into certain death (r < length + 2), 
+            # we refund the portal penalties because jumping blindly is better than suffocating.
+            if r < length + 2 and j != nb(head, d):
+                s += PORTAL_PEN + ENDGAME_PORTAL_PEN
+            
             for enemy, eid, _ in head_threats(j):
                 if enemy and eid in prey_ids:
                     s += HUNT_ADJ_W
                 else:
                     s -= HEAD_RISK
             if j in cut: s -= TEAM_CUT_PEN
-            if mates_near: s -= TEAM_NEAR_PEN * mates_within2(j)
+            if mates_near: s -= dynamic_team_pen * mates_within2(j)
             s += EXPLORE_W * unknown[d] / SEARCH_NODES
             s -= VISIT_PEN * visits.get(j, 0)
             if d == facing: s += STRAIGHT_BONUS
