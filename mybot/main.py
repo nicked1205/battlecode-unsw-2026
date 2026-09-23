@@ -27,8 +27,8 @@ MIN_PEARL_CLUSTER = 3
 # Movement & Heuristic Weights
 PEARL_W = 60.0
 MEMORY_PEARL_W = 21.0
-SPAWN_W = 14.0
-SPAWN_HORIZON = 12
+SPAWN_W = 25.0
+SPAWN_HORIZON = 40
 SEARCH_NODES = 220
 SPACE_MARGIN = 10
 SPACE_CAP = 100
@@ -476,8 +476,13 @@ def choose():
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
 
-    # Early-Game Fan Out: Severely penalize moving near teammates to force maximum map exploration
-    dynamic_team_pen = TEAM_NEAR_PEN * 5.0 if rnd < 20 else TEAM_NEAR_PEN
+    # Early-Game Fan Out OR Hub Crowd Control
+    if rnd < 20:
+        dynamic_team_pen = TEAM_NEAR_PEN * 5.0
+    else:
+        # If 3 or more teammates are loitering in the same area, aggressively push them apart
+        # This prevents collateral crashes while camping hubs
+        dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
 
     best_d, best_s = None, -1e18
     for d in range(4):
@@ -485,9 +490,14 @@ def choose():
         if j == -1:
             continue
         if j == -2:
-            # Dynamic Curiosity: Unknown portals are practically free early game, but heavily penalized late game
-            curiosity_factor = min(rnd / 250.0, 1.0) 
-            s = -(PORTAL_UNKNOWN_PEN * curiosity_factor) + rng.random()
+            # Active Exploration Bonus: Treat unknown portals as high-value targets before round 50
+            if rnd < 50:
+                s = (EXPLORE_W * 2.0) + rng.random()
+            else:
+                # Gradual Paranoia: Ramp up the penalty steadily from round 50 to 250
+                curiosity_factor = min((rnd - 50) / 200.0, 1.0) 
+                s = -(PORTAL_UNKNOWN_PEN * curiosity_factor) + rng.random()
+                
             if endgame: s -= ENDGAME_PORTAL_PEN
         elif j in prey:
             s = HUNT_KILL_W + rng.random()
