@@ -20,6 +20,8 @@ SPLIT_UNTIL = 250
 SPLIT_AT = 4 
 CHILD_SIZE = 2
 MAX_UNITS = 64
+KING_LENGTH = 12
+MIN_SWARM_UNITS = 15
 
 # Sonar
 MIN_PEARL_CLUSTER = 3
@@ -35,19 +37,19 @@ SPACE_CAP = 100
 TRAP_PEN = 6.0
 PORTAL_PEN = 8.0
 PORTAL_STALE_PEN = 25.0
-HEAD_RISK = 28.0
+HEAD_RISK = 85.0
 TEAM_CUT_PEN = 20.0
 TEAM_NEAR_PEN = 1.5
 PORTAL_UNKNOWN_PEN = 100.0
-PORTAL_SCOUT_MULT = 0.6
+PORTAL_SCOUT_MULT = 0.7
 LETHAL_PEN = 100.0
 VISIT_PEN = 2.8
 EXPLORE_W = 8.4
-STRAIGHT_BONUS = 0.5
+STRAIGHT_BONUS = 2.5
 OTHER_TTL = 2
 VACATE_MARGIN = 1
 HUNT_ENABLE = 1
-HUNT_MAX_LEN = 5
+HUNT_MAX_LEN = 6
 HUNT_MIN_UNITS = 3
 HUNT_MIN_ENEMY_SEGS = 8
 HUNT_WINDOW_FRAC = 0.3
@@ -60,6 +62,19 @@ CORRIDOR_MIN = 2
 ENDGAME_ROUND = 400
 ENDGAME_SPACE_MULT = 2.0
 ENDGAME_PORTAL_PEN = 40.0
+SCOUT_ROUND = 80
+
+# ==========================================
+# MAP FINGERPRINTING & FLAGS
+# ==========================================
+# Format: {(WIDTH, HEIGHT): [(x1, y1), (x2, y2)]}
+HUB_FLAGS = {
+    (16, 16): [(5, 10), (2, 13)],
+    (25, 25): [(12, 22)],
+    (32, 16): [(16, 5)]    
+}
+ACTIVE_FLAGS = set()
+FLAG_W = 150.0  # Massive score to completely override pearls and fog
 
 # ==========================================
 # UPGRADED SONAR PROTOCOL
@@ -125,7 +140,7 @@ traj = []
 LAST_ROW = 0
 
 def setup():
-    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW
+    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW, ACTIVE_FLAGS
     WID, HEI = game.get_map_size()
     n = WID * HEI
     LAST_ROW = (HEI - 1) * WID
@@ -133,6 +148,11 @@ def setup():
     vedge = [0] * n
     seen_round = [-1] * n
     ptime = [-1] * n
+    
+    # Load map-specific flags if we recognize the dimensions
+    if (WID, HEI) in HUB_FLAGS:
+        for fx, fy in HUB_FLAGS[(WID, HEI)]:
+            ACTIVE_FLAGS.add(fy * WID + fx)
 
 def nb(idx, d):
     if d == 0: return idx - WID if idx >= WID else idx + LAST_ROW
@@ -210,6 +230,11 @@ def observe():
     for t in ct.get_tiles():
         p = t.get_position()
         idx = p.y * WID + p.x
+
+        # VISUAL HAND-OFF: Erase the artificial flag the moment ANY scout sees it
+        if idx in ACTIVE_FLAGS:
+            ACTIVE_FLAGS.remove(idx)
+
         seen_round[idx] = rnd
         ptime[idx] = t.get_pearl_time()
         if t.has_pearl():
@@ -326,7 +351,7 @@ def search(head, blocked, vacate, targets=()):
     get = vacate.get
 
     # Pre-calculate early-game portal gravity (Massive pull before round 50)
-    curiosity_pull = (PEARL_W * PORTAL_SCOUT_MULT) if rnd < 50 else 0
+    curiosity_pull = (PEARL_W * PORTAL_SCOUT_MULT) if rnd < SCOUT_ROUND else 0
 
     while q and expanded < SEARCH_NODES:
         idx, first, dist = pop()
@@ -341,6 +366,12 @@ def search(head, blocked, vacate, targets=()):
                     v = curiosity_pull / (1 + dist)
                     if v > best[first]:
                         best[first] = v
+
+        # DISTANT FLAG GRAVITY: Pull scouts precisely to the flag within 300 nodes
+        if rnd < SCOUT_ROUND and (idx in ACTIVE_FLAGS):
+            v = FLAG_W / (1 + dist)
+            if v > best[first]:
+                best[first] = v
         
         sr = seen_round[idx]
         if sr < 0:
@@ -428,10 +459,16 @@ def hunt_prey(length, units, rnd, mates_xy=None):
         if not is_threat_to_team:
             if length > maxlen:
                 continue
-            if segs <= length:
+
+            # ASYMMETRIC TRADE LOGIC:
+            # Small dragons (length 2 or 3) will act as kamikaze missiles to intercept anyone.
+            # Large dragons (length 4+) will strictly ignore small enemies to preserve their mass.
+            if length > 3 and segs < length - 1:
                 continue
-            if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
-                continue
+            # if segs <= length:
+            #     continue
+            # if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
+            #     continue
                 
         ids.add(eid)
         if j >= 0:
@@ -501,6 +538,16 @@ def choose():
     #     # This prevents collateral crashes while camping hubs
     #     dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
 
+    # Pre-calculate current wrapped distance to the closest flag
+    current_flag_dist = 9999
+    if rnd < SCOUT_ROUND and ACTIVE_FLAGS:
+        hx, hy = head % WID, head // WID
+        for f in ACTIVE_FLAGS:
+            fx, fy = f % WID, f // WID
+            dx = min(abs(hx - fx), WID - abs(hx - fx))
+            dy = min(abs(hy - fy), HEI - abs(hy - fy))
+            current_flag_dist = min(current_flag_dist, dx + dy)
+
     best_d, best_s = None, -1e18
     for d in range(4):
         j = step(head, d)
@@ -508,7 +555,7 @@ def choose():
             continue
         if j == -2:
             # Extreme Curiosity: A blind portal must explicitly outscore an adjacent pearl
-            if rnd < 50:
+            if rnd < SCOUT_ROUND:
                 s = (PEARL_W * PORTAL_SCOUT_MULT) + rng.random()
             else:
                 # Gradual Paranoia: Ramp up the penalty steadily from round 50 to 250
@@ -516,13 +563,28 @@ def choose():
                 s = -(PORTAL_UNKNOWN_PEN * curiosity_factor) + rng.random()
                 
             if endgame: s -= ENDGAME_PORTAL_PEN
-
-        elif j in prey:
-            s = HUNT_KILL_W + rng.random()
         else:
+            # Mandatory survival check MUST happen before hunting
             if not passable(j, 1, blocked, vacate):
                 continue
-            s = pearl_val[d]
+            if j in prey:
+                s = HUNT_KILL_W + rng.random()
+            else:
+                s = pearl_val[d]
+
+            # GLOBAL COMPASS: If a move physically steps us closer to the flag, boost the score
+            if rnd < SCOUT_ROUND and ACTIVE_FLAGS:
+                nx, ny = j % WID, j // WID
+                next_flag_dist = 9999
+                for f in ACTIVE_FLAGS:
+                    fx, fy = f % WID, f // WID
+                    dx = min(abs(nx - fx), WID - abs(nx - fx))
+                    dy = min(abs(ny - fy), HEI - abs(ny - fy))
+                    next_flag_dist = min(next_flag_dist, dx + dy)
+                
+                # +12.0 strongly overrides standard fog of war (+8.4), acting as a tiebreaker
+                if next_flag_dist < current_flag_dist:
+                    s += 12.0
 
             # Portal Traversal Logic
             if j != nb(head, d):
@@ -547,12 +609,19 @@ def choose():
             # we refund the portal penalties because jumping blindly is better than suffocating.
             if r < length + 2 and j != nb(head, d):
                 s += PORTAL_PEN + ENDGAME_PORTAL_PEN
+
+            # DYNAMIC HEAD RISK: Large dragons prioritize evasion, small dragons hold the line
+            dynamic_head_risk = HEAD_RISK + (max(0, length - 3) * 25.0)
             
             for enemy, eid, _ in head_threats(j):
-                if enemy and eid in prey_ids:
-                    s += HUNT_ADJ_W
+                if enemy:
+                    if eid in prey_ids:
+                        s += HUNT_ADJ_W
+                    else:
+                        s -= dynamic_head_risk  # Kings flee from un-hunted enemies
                 else:
-                    s -= HEAD_RISK
+                    s -= HEAD_RISK  # Standard collision avoidance for teammates
+
             if j in cut: s -= TEAM_CUT_PEN
             if mates_near: s -= dynamic_team_pen * mates_within2(j)
             s += EXPLORE_W * unknown[d] / SEARCH_NODES
@@ -565,13 +634,27 @@ def choose():
     return best_d
 
 def maybe_split():
+    length = ct.get_length()
+    units = ct.get_unit_count()
     rnd = game.get_round_num()
-    if rnd > SPLIT_UNTIL or rnd >= ENDGAME_ROUND:
+    
+    # 1. Hard population cap and basic viability check
+    if units >= MAX_UNITS or length < SPLIT_AT:
         return False
-    if ct.get_length() < SPLIT_AT or ct.get_unit_count() >= MAX_UNITS:
+        
+    # 2. Dynamic Strategy Flags
+    is_endgame = rnd >= ENDGAME_ROUND
+    is_king = length >= KING_LENGTH
+    
+    # 3. The Floor Check: If the swarm is healthy, Kings and Endgame dragons refuse to split.
+    # If the swarm drops below the minimum floor, emergency splitting resumes to regain map control.
+    if (is_endgame or is_king) and units >= MIN_SWARM_UNITS:
         return False
+        
+    # 4. Physical geometry check
     if not ct.can_split(CHILD_SIZE):
         return False
+    
     ct.do_split(CHILD_SIZE)
     return True
 
