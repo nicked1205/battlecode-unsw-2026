@@ -15,8 +15,8 @@ DEBUG = False
 # ==========================================
 SECRET_KEY = 0b10101010101010101010101010101010  # From main_6.py
 
-# Phase-Shifted Economy rules from main_6.py (Split only before round 100)
-SPLIT_UNTIL = 300 
+# Phase-Shifted Economy rules
+SPLIT_UNTIL = 250 
 SPLIT_AT = 4 
 CHILD_SIZE = 2
 MAX_UNITS = 64
@@ -29,27 +29,27 @@ MIN_PEARL_CLUSTER = 3
 # Movement & Heuristic Weights
 PEARL_W = 60.0
 MEMORY_PEARL_W = 21.0
-SPAWN_W = 40.0
+SPAWN_W = 25.0
 SPAWN_HORIZON = 40
-SEARCH_NODES = 300
+SEARCH_NODES = 350
 SPACE_MARGIN = 10
 SPACE_CAP = 100
-TRAP_PEN = 30.0
+TRAP_PEN = 6.0
 PORTAL_PEN = 8.0
 PORTAL_STALE_PEN = 25.0
-HEAD_RISK = 85.0
-TEAM_CUT_PEN = 90.0
+HEAD_RISK = 28.0
+TEAM_CUT_PEN = 20.0
 TEAM_NEAR_PEN = 1.5
 PORTAL_UNKNOWN_PEN = 100.0
-PORTAL_SCOUT_MULT = 0.7
+PORTAL_SCOUT_MULT = 0.6
 LETHAL_PEN = 100.0
 VISIT_PEN = 2.8
 EXPLORE_W = 8.4
-STRAIGHT_BONUS = 2.5
+STRAIGHT_BONUS = 0.5
 OTHER_TTL = 2
 VACATE_MARGIN = 1
 HUNT_ENABLE = 1
-HUNT_MAX_LEN = 6
+HUNT_MAX_LEN = 5
 HUNT_MIN_UNITS = 3
 HUNT_MIN_ENEMY_SEGS = 8
 HUNT_WINDOW_FRAC = 0.3
@@ -62,19 +62,7 @@ CORRIDOR_MIN = 2
 ENDGAME_ROUND = 400
 ENDGAME_SPACE_MULT = 2.0
 ENDGAME_PORTAL_PEN = 40.0
-SCOUT_ROUND = 80
-
-# ==========================================
-# MAP FINGERPRINTING & FLAGS
-# ==========================================
-# Format: {(WIDTH, HEIGHT): [(x1, y1), (x2, y2)]}
-HUB_FLAGS = {
-    (16, 16): [(5, 10), (2, 12)],
-    (25, 25): [(12, 22)],
-    (32, 16): [(16, 10)]    
-}
-ACTIVE_FLAGS = set()
-FLAG_W = 150.0  # Massive score to completely override pearls and fog
+SCOUT_ROUND = 50
 
 # ==========================================
 # UPGRADED SONAR PROTOCOL
@@ -140,7 +128,7 @@ traj = []
 LAST_ROW = 0
 
 def setup():
-    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW, ACTIVE_FLAGS
+    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW
     WID, HEI = game.get_map_size()
     n = WID * HEI
     LAST_ROW = (HEI - 1) * WID
@@ -148,11 +136,6 @@ def setup():
     vedge = [0] * n
     seen_round = [-1] * n
     ptime = [-1] * n
-    
-    # Load map-specific flags if we recognize the dimensions
-    if (WID, HEI) in HUB_FLAGS:
-        for fx, fy in HUB_FLAGS[(WID, HEI)]:
-            ACTIVE_FLAGS.add(fy * WID + fx)
 
 def nb(idx, d):
     if d == 0: return idx - WID if idx >= WID else idx + LAST_ROW
@@ -230,10 +213,6 @@ def observe():
     for t in ct.get_tiles():
         p = t.get_position()
         idx = p.y * WID + p.x
-
-        # VISUAL HAND-OFF: Erase the artificial flag the moment ANY scout sees it
-        if idx in ACTIVE_FLAGS:
-            ACTIVE_FLAGS.remove(idx)
 
         seen_round[idx] = rnd
         ptime[idx] = t.get_pearl_time()
@@ -367,12 +346,6 @@ def search(head, blocked, vacate, targets=()):
                     if v > best[first]:
                         best[first] = v
 
-        # DISTANT FLAG GRAVITY: Pull scouts precisely to the flag within 300 nodes
-        if rnd < SCOUT_ROUND and (idx in ACTIVE_FLAGS):
-            v = FLAG_W / (1 + dist)
-            if v > best[first]:
-                best[first] = v
-        
         sr = seen_round[idx]
         if sr < 0:
             unknown[first] += 1
@@ -386,7 +359,7 @@ def search(head, blocked, vacate, targets=()):
             if pt >= 0:
                 pred = pt - (rnd - sr)
                 if 0 <= pred <= SPAWN_HORIZON:
-                    v = SPAWN_W / (1 + dist + (pred * 0.2))
+                    v = SPAWN_W / (1 + max(pred, dist))
                     if v > best[first]:
                         best[first] = v
         nd = dist + 1
@@ -460,31 +433,30 @@ def hunt_prey(length, units, rnd, mates_xy=None):
             if length > maxlen:
                 continue
 
-            # ASYMMETRIC TRADE LOGIC:
-            # Small dragons (length 2 or 3) will act as kamikaze missiles to intercept anyone.
-            # Large dragons (length 4+) will strictly ignore small enemies to preserve their mass.
-            if length > 3 and segs < length - 1:
+            if segs <= length:
                 continue
-            # if segs <= length:
-            #     continue
-            # if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
-            #     continue
+            if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
+                continue
                 
         ids.add(eid)
         if j >= 0:
             inter.add(j)
 
-        # THE BODY-BLOCK TACTIC: Always target the tile directly IN FRONT of the enemy's facing.
-        # This guarantees they crash into your body segments and die, while you survive.
-        if j >= 0:
-            prey.add(j)
-            
-            # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
-            for flank_dir in range(4):
-                if flank_dir != hd and flank_dir != DIR_OF[Direction(DIRS[hd]).get_opposite()]:
-                    flank_tile = step(j, flank_dir)
-                    if flank_tile >= 0:
-                        inter.add(flank_tile)
+        # ID CHECK: Only step on current head tile if enemy has ALREADY moved
+        if eid < me:
+            prey.add(hidx)
+        else:
+            # Enemy moves after us; step onto their destination to force a crash
+            if j >= 0:
+                prey.add(j)
+                
+                # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
+                for flank_dir in range(4):
+                    # Ignore directly ahead and directly behind their facing
+                    if flank_dir != hd and flank_dir != DIR_OF[Direction(DIRS[hd]).get_opposite()]:
+                        flank_tile = step(j, flank_dir)
+                        if flank_tile >= 0:
+                            inter.add(flank_tile)
 
     return prey, ids, inter
 
@@ -516,26 +488,7 @@ def choose():
     rnd = game.get_round_num()
     endgame = rnd >= ENDGAME_ROUND
 
-    # DYNAMIC KING SUCCESSION
-    my_id = ct.get_id()
-    is_king = True
-    
-    for hidx, (enemy, eid, hd) in heads.items():
-        if not enemy:
-            mate_len = seg_count.get(eid, 0)
-            # Yield the throne if a teammate is visibly larger, or equal size but older
-            if mate_len > length or (mate_len == length and eid < my_id):
-                is_king = False
-                break
-                
-    # Permanent anchors are always Kings
-    if length >= KING_LENGTH:
-        is_king = True
-
-    # CLUSTER FIX: Small dragons (length <= 3) are brave and only need 2 extra tiles of margin.
-    # Large dragons still demand wide open spaces to prevent getting trapped.
-    dynamic_margin = 4 if length <= 3 else SPACE_MARGIN
-    margin = dynamic_margin * ENDGAME_SPACE_MULT if endgame else dynamic_margin
+    margin = SPACE_MARGIN * ENDGAME_SPACE_MULT if endgame else SPACE_MARGIN
     
     need = min(int(2 * length + margin), SPACE_CAP)
 
@@ -545,30 +498,13 @@ def choose():
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
 
-    # Early-Game Fan Out: Severely penalize moving near teammates to force maximum map exploration
-    dynamic_team_pen = TEAM_NEAR_PEN * 5.0 if rnd < 40 else TEAM_NEAR_PEN
-
-    # DEFENSIVE PHALANX: If enemies are in vision, disable spacing so we form a wall
-    if heads:
-        dynamic_team_pen = 0.5
-
-    # # Early-Game Fan Out OR Hub Crowd Control
-    # if rnd < 30:
-    #     dynamic_team_pen = TEAM_NEAR_PEN * 5.0
-    # else:
-    #     # If 3 or more teammates are loitering in the same area, aggressively push them apart
-    #     # This prevents collateral crashes while camping hubs
-    #     dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
-
-    # Pre-calculate current wrapped distance to the closest flag
-    current_flag_dist = 9999
-    if rnd < SCOUT_ROUND and ACTIVE_FLAGS:
-        hx, hy = head % WID, head // WID
-        for f in ACTIVE_FLAGS:
-            fx, fy = f % WID, f // WID
-            dx = min(abs(hx - fx), WID - abs(hx - fx))
-            dy = min(abs(hy - fy), HEI - abs(hy - fy))
-            current_flag_dist = min(current_flag_dist, dx + dy)
+    # Early-Game Fan Out OR Hub Crowd Control
+    if rnd < 20:
+        dynamic_team_pen = TEAM_NEAR_PEN * 5.0
+    else:
+        # If 3 or more teammates are loitering in the same area, aggressively push them apart
+        # This prevents collateral crashes while camping hubs
+        dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
 
     best_d, best_s = None, -1e18
     for d in range(4):
@@ -590,50 +526,13 @@ def choose():
             if not passable(j, 1, blocked, vacate):
                 continue
             
-            # THE ROYAL BANQUET: Kings eat first
-            if pearls.get(j) == rnd:
-                if not is_king:
-                    king_can_reach = False
-                    for hidx, (enemy, eid, hd) in heads.items():
-                        if not enemy and (seg_count.get(eid, 0) > length or (seg_count.get(eid, 0) == length and eid < my_id)):
-                            kx, ky = hidx % WID, hidx // WID
-                            px, py = j % WID, j // WID
-                            dx = min(abs(kx - px), WID - abs(kx - px))
-                            dy = min(abs(ky - py), HEI - abs(ky - py))
-                            if (dx + dy) <= 3:
-                                king_can_reach = True
-                                break
-                    
-                    if king_can_reach:
-                        s = pearl_val[d] - 100.0  # Refuse to steal the King's food
-                    else:
-                        s = PEARL_W * 2.0 + rng.random()
-                else:
-                    s = PEARL_W * 2.0 + rng.random()
-            elif j in prey:
+            if j in prey:
                 s = HUNT_KILL_W + rng.random()
             else:
                 s = pearl_val[d]
 
-            # GLOBAL COMPASS: If a move physically steps us closer to the flag, boost the score
-            if rnd < SCOUT_ROUND and ACTIVE_FLAGS:
-                nx, ny = j % WID, j // WID
-                next_flag_dist = 9999
-                for f in ACTIVE_FLAGS:
-                    fx, fy = f % WID, f // WID
-                    dx = min(abs(nx - fx), WID - abs(nx - fx))
-                    dy = min(abs(ny - fy), HEI - abs(ny - fy))
-                    next_flag_dist = min(next_flag_dist, dx + dy)
-                
-                # +12.0 strongly overrides standard fog of war (+8.4), acting as a tiebreaker
-                if next_flag_dist < current_flag_dist:
-                    s += 12.0
-
             # Portal Traversal Logic
             if j != nb(head, d):
-                # EXIT CLEARANCE CHECK: Abort the jump if our memory says the exit tile is occupied
-                if j in others or j in heads:
-                    continue
                 
                 s -= PORTAL_PEN
                 if endgame: s -= ENDGAME_PORTAL_PEN
@@ -657,25 +556,16 @@ def choose():
             if r < length + 2 and j != nb(head, d):
                 s += PORTAL_PEN + ENDGAME_PORTAL_PEN
 
-            # THE ROYAL GUARD: Kings prioritize evasion, peasants hold the line
-            if is_king:
-                dynamic_head_risk = HEAD_RISK + 50.0  
-            else:
-                dynamic_head_risk = HEAD_RISK + (max(0, length - 3) * 25.0)
-            
             for enemy, eid, _ in head_threats(j):
-                if enemy:
-                    if eid in prey_ids:
-                        s += HUNT_ADJ_W
-                    else:
-                        s -= dynamic_head_risk  # Kings flee from un-hunted enemies
+                if enemy and eid in prey_ids:
+                    s += HUNT_ADJ_W
                 else:
-                    s -= HEAD_RISK  # Standard collision avoidance for teammates
+                    s -= HEAD_RISK
 
             if j in cut: s -= TEAM_CUT_PEN
             if mates_near: s -= dynamic_team_pen * mates_within2(j)
             s += EXPLORE_W * unknown[d] / SEARCH_NODES
-            # s -= VISIT_PEN * visits.get(j, 0)
+            s -= VISIT_PEN * visits.get(j, 0)
             if d == facing: s += STRAIGHT_BONUS
             s += rng.random() * 0.3
         
