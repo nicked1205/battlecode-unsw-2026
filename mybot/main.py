@@ -16,12 +16,12 @@ DEBUG = False
 SECRET_KEY = 0b10101010101010101010101010101010  # From main_6.py
 
 # Phase-Shifted Economy rules from main_6.py (Split only before round 100)
-SPLIT_UNTIL = 250 
+SPLIT_UNTIL = 300 
 SPLIT_AT = 4 
 CHILD_SIZE = 2
 MAX_UNITS = 64
 KING_LENGTH = 12
-MIN_SWARM_UNITS = 15
+MIN_SWARM_UNITS = 20
 
 # Sonar
 MIN_PEARL_CLUSTER = 3
@@ -34,11 +34,11 @@ SPAWN_HORIZON = 40
 SEARCH_NODES = 300
 SPACE_MARGIN = 10
 SPACE_CAP = 100
-TRAP_PEN = 6.0
+TRAP_PEN = 30.0
 PORTAL_PEN = 8.0
 PORTAL_STALE_PEN = 25.0
 HEAD_RISK = 85.0
-TEAM_CUT_PEN = 20.0
+TEAM_CUT_PEN = 90.0
 TEAM_NEAR_PEN = 1.5
 PORTAL_UNKNOWN_PEN = 100.0
 PORTAL_SCOUT_MULT = 0.7
@@ -69,9 +69,9 @@ SCOUT_ROUND = 80
 # ==========================================
 # Format: {(WIDTH, HEIGHT): [(x1, y1), (x2, y2)]}
 HUB_FLAGS = {
-    (16, 16): [(5, 10), (2, 13)],
+    (16, 16): [(5, 10), (2, 12)],
     (25, 25): [(12, 22)],
-    (32, 16): [(16, 5)]    
+    (32, 16): [(16, 10)]    
 }
 ACTIVE_FLAGS = set()
 FLAG_W = 150.0  # Massive score to completely override pearls and fog
@@ -474,21 +474,17 @@ def hunt_prey(length, units, rnd, mates_xy=None):
         if j >= 0:
             inter.add(j)
 
-        # ID CHECK: Only step on current head tile if enemy has ALREADY moved
-        if eid < me:
-            prey.add(hidx)
-        else:
-            # Enemy moves after us; step onto their destination to force a crash
-            if j >= 0:
-                prey.add(j)
-                
-                # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
-                for flank_dir in range(4):
-                    # Ignore directly ahead and directly behind their facing
-                    if flank_dir != hd and flank_dir != DIR_OF[Direction(DIRS[hd]).get_opposite()]:
-                        flank_tile = step(j, flank_dir)
-                        if flank_tile >= 0:
-                            inter.add(flank_tile)
+        # THE BODY-BLOCK TACTIC: Always target the tile directly IN FRONT of the enemy's facing.
+        # This guarantees they crash into your body segments and die, while you survive.
+        if j >= 0:
+            prey.add(j)
+            
+            # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
+            for flank_dir in range(4):
+                if flank_dir != hd and flank_dir != DIR_OF[Direction(DIRS[hd]).get_opposite()]:
+                    flank_tile = step(j, flank_dir)
+                    if flank_tile >= 0:
+                        inter.add(flank_tile)
 
     return prey, ids, inter
 
@@ -519,8 +515,30 @@ def choose():
     blocked, vacate = build_blockers()
     rnd = game.get_round_num()
     endgame = rnd >= ENDGAME_ROUND
-    margin = SPACE_MARGIN * ENDGAME_SPACE_MULT if endgame else SPACE_MARGIN
+
+    # DYNAMIC KING SUCCESSION
+    my_id = ct.get_id()
+    is_king = True
+    
+    for hidx, (enemy, eid, hd) in heads.items():
+        if not enemy:
+            mate_len = seg_count.get(eid, 0)
+            # Yield the throne if a teammate is visibly larger, or equal size but older
+            if mate_len > length or (mate_len == length and eid < my_id):
+                is_king = False
+                break
+                
+    # Permanent anchors are always Kings
+    if length >= KING_LENGTH:
+        is_king = True
+
+    # CLUSTER FIX: Small dragons (length <= 3) are brave and only need 2 extra tiles of margin.
+    # Large dragons still demand wide open spaces to prevent getting trapped.
+    dynamic_margin = 4 if length <= 3 else SPACE_MARGIN
+    margin = dynamic_margin * ENDGAME_SPACE_MULT if endgame else dynamic_margin
+    
     need = min(int(2 * length + margin), SPACE_CAP)
+
     mates_xy = [(m % WID, m // WID) for m in mates_near] if mates_near else None
     prey, prey_ids, intercepts = hunt_prey(length, units, rnd, mates_xy)
     pearl_val, unknown, hunt_dist = search(head, blocked, vacate, intercepts)
@@ -529,6 +547,10 @@ def choose():
 
     # Early-Game Fan Out: Severely penalize moving near teammates to force maximum map exploration
     dynamic_team_pen = TEAM_NEAR_PEN * 5.0 if rnd < 40 else TEAM_NEAR_PEN
+
+    # DEFENSIVE PHALANX: If enemies are in vision, disable spacing so we form a wall
+    if heads:
+        dynamic_team_pen = 0.5
 
     # # Early-Game Fan Out OR Hub Crowd Control
     # if rnd < 30:
@@ -567,7 +589,28 @@ def choose():
             # Mandatory survival check MUST happen before hunting
             if not passable(j, 1, blocked, vacate):
                 continue
-            if j in prey:
+            
+            # THE ROYAL BANQUET: Kings eat first
+            if pearls.get(j) == rnd:
+                if not is_king:
+                    king_can_reach = False
+                    for hidx, (enemy, eid, hd) in heads.items():
+                        if not enemy and (seg_count.get(eid, 0) > length or (seg_count.get(eid, 0) == length and eid < my_id)):
+                            kx, ky = hidx % WID, hidx // WID
+                            px, py = j % WID, j // WID
+                            dx = min(abs(kx - px), WID - abs(kx - px))
+                            dy = min(abs(ky - py), HEI - abs(ky - py))
+                            if (dx + dy) <= 3:
+                                king_can_reach = True
+                                break
+                    
+                    if king_can_reach:
+                        s = pearl_val[d] - 100.0  # Refuse to steal the King's food
+                    else:
+                        s = PEARL_W * 2.0 + rng.random()
+                else:
+                    s = PEARL_W * 2.0 + rng.random()
+            elif j in prey:
                 s = HUNT_KILL_W + rng.random()
             else:
                 s = pearl_val[d]
@@ -588,6 +631,10 @@ def choose():
 
             # Portal Traversal Logic
             if j != nb(head, d):
+                # EXIT CLEARANCE CHECK: Abort the jump if our memory says the exit tile is occupied
+                if j in others or j in heads:
+                    continue
+                
                 s -= PORTAL_PEN
                 if endgame: s -= ENDGAME_PORTAL_PEN
                 
@@ -610,8 +657,11 @@ def choose():
             if r < length + 2 and j != nb(head, d):
                 s += PORTAL_PEN + ENDGAME_PORTAL_PEN
 
-            # DYNAMIC HEAD RISK: Large dragons prioritize evasion, small dragons hold the line
-            dynamic_head_risk = HEAD_RISK + (max(0, length - 3) * 25.0)
+            # THE ROYAL GUARD: Kings prioritize evasion, peasants hold the line
+            if is_king:
+                dynamic_head_risk = HEAD_RISK + 50.0  
+            else:
+                dynamic_head_risk = HEAD_RISK + (max(0, length - 3) * 25.0)
             
             for enemy, eid, _ in head_threats(j):
                 if enemy:
@@ -625,7 +675,7 @@ def choose():
             if j in cut: s -= TEAM_CUT_PEN
             if mates_near: s -= dynamic_team_pen * mates_within2(j)
             s += EXPLORE_W * unknown[d] / SEARCH_NODES
-            s -= VISIT_PEN * visits.get(j, 0)
+            # s -= VISIT_PEN * visits.get(j, 0)
             if d == facing: s += STRAIGHT_BONUS
             s += rng.random() * 0.3
         
