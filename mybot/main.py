@@ -20,6 +20,9 @@ SECRET_KEY = 0b10101010101010101010101010101010
 SONAR_SIG = 0xAA
 MSG_PEARL = 1
 MSG_THREAT = 2
+MSG_KING = 3
+
+king_beacons = {}
 
 def process_sonar() -> None:
     """Reads decrypts broadcasts and injects them directly into V3 memory arrays."""
@@ -46,11 +49,21 @@ def process_sonar() -> None:
                 # Treat the coordinate as a highly dangerous obstacle for 5 rounds
                 others[idx] = rnd + THREAT_TTL 
 
+            elif msg_type == MSG_KING:
+                # Store the king's location and round of detection
+                king_beacons[idx] = rnd
+
+    # Clean up stale beacons (older than 10 rounds)
+    for k in list(king_beacons.keys()):
+        if rnd - king_beacons[k] > 10:
+            del king_beacons[k]
+
 def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int) -> None:
     """Packs coordinates and a message type into a 32-bit integer for broadcast."""
     message = (target_x << 24) | (target_y << 16) | (msg_type << 8) | SONAR_SIG
     encrypted = message ^ SECRET_KEY
-    ct.send_sonar(encrypted)
+    for d in DIRS:
+        ct.send_sonar(d, encrypted)
 
 # ==========================================
 # V3 1D PATHFINDING ENGINE
@@ -462,8 +475,12 @@ def wdist(a, b):
 def is_king(length, rnd):
     if not KP_ENABLE or rnd < KP_ROUND or length < KP_MIN_LEN:
         return False
+
+    my_id = ct.get_id()
     for pid in mate_ids:
-        if seg_count.get(pid, 0) > length:
+        mate_len = seg_count.get(pid, 0)
+        # Yield if they are longer, OR if they are the exact same size but older
+        if mate_len > length or (mate_len == length and pid < my_id):
             return False
     return True
 
@@ -534,6 +551,16 @@ def choose():
         # This prevents collateral crashes while camping hubs
         dynamic_team_pen = TEAM_NEAR_PEN * (CROWD_TEAM_MULT if len(mates_near) >= CROWD_MATES else 1.0)
 
+    # THE ROYAL SUMMONS: Lock onto the nearest active King beacon
+    active_summon = None
+    summon_dist = 9999
+    if CASH_ENABLE and rnd >= CASH_ROUND and length <= CASH_MAXLEN and king_beacons:
+        for b_idx in king_beacons:
+            d_val = wdist(head, b_idx)
+            if d_val < summon_dist:
+                summon_dist = d_val
+                active_summon = b_idx
+
     best_d, best_s = None, -1e18
     for d in range(4):
         j = step(head, d)
@@ -558,6 +585,11 @@ def choose():
                 s = HUNT_KILL_W + rng.random()
             else:
                 s = pearl_val[d]
+
+            # GLOBAL COMPASS: Pull small scouts toward the raycast beacon
+            if active_summon is not None:
+                if wdist(j, active_summon) < summon_dist:
+                    s += CASH_W  # Massive gravity to override standard exploration
 
             # Portal Traversal Logic
             if j != nb(head, d):
@@ -638,14 +670,14 @@ def maybe_split():
         
     # 2. Strategy Flags
     is_endgame = rnd >= ENDGAME_ROUND
-    is_king = is_anchor()
+    am_king = is_anchor() or is_king(length, rnd)
     
     # Optional safety from Version 2
     if is_long(length, rnd):
         return False
 
     # 3. King / Anchor Economy
-    if is_king:
+    if am_king:
         # Emergency Floor Check (from Version 1): Kings MUST split if the swarm is dying.
         emergency = units < MIN_SWARM_UNITS
         
@@ -700,7 +732,12 @@ def execute_turn():
         visits[head] = visits.get(head, 0) + 1
         
     observe()
-    process_sonar()  # Restored from main_6.py
+    process_sonar()
+
+    # THE ROYAL BROADCAST: Kings fire 4-way raycasts to summon scouts
+    if CASH_ENABLE and game.get_round_num() >= CASH_ROUND:
+        if is_king(ct.get_length(), game.get_round_num()) and rng.random() < 0.2:
+            send_encrypted_sonar(p.x, p.y, MSG_KING)
     
     if maybe_split():
         return
