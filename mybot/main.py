@@ -5,69 +5,18 @@ from collections import deque
 import helper as unswbc
 from helper import Direction, EdgeType
 
+from params import *
+
 ct: unswbc.Controller
 game: unswbc.Game
 
 DEBUG = False
 
 # ==========================================
-# TUNABLE WEIGHTS & MAIN_6.PY SECRETS
-# ==========================================
-SECRET_KEY = 0b10101010101010101010101010101010  # From main_6.py
-
-# Phase-Shifted Economy rules
-SPLIT_UNTIL = 250 
-SPLIT_AT = 4 
-CHILD_SIZE = 2
-MAX_UNITS = 64
-KING_LENGTH = 12
-MIN_SWARM_UNITS = 20
-
-# Sonar
-MIN_PEARL_CLUSTER = 3
-
-# Movement & Heuristic Weights
-PEARL_W = 60.0
-MEMORY_PEARL_W = 21.0
-SPAWN_W = 25.0
-SPAWN_HORIZON = 40
-SEARCH_NODES = 350
-SPACE_MARGIN = 10
-SPACE_CAP = 100
-TRAP_PEN = 6.0
-PORTAL_PEN = 8.0
-PORTAL_STALE_PEN = 25.0
-HEAD_RISK = 28.0
-TEAM_CUT_PEN = 20.0
-TEAM_NEAR_PEN = 1.5
-PORTAL_UNKNOWN_PEN = 100.0
-PORTAL_SCOUT_MULT = 0.6
-LETHAL_PEN = 100.0
-VISIT_PEN = 2.8
-EXPLORE_W = 8.4
-STRAIGHT_BONUS = 0.5
-OTHER_TTL = 2
-VACATE_MARGIN = 1
-HUNT_ENABLE = 1
-HUNT_MAX_LEN = 5
-HUNT_MIN_UNITS = 3
-HUNT_MIN_ENEMY_SEGS = 8
-HUNT_WINDOW_FRAC = 0.3
-HUNT_KILL_W = 1000.0
-HUNT_W = 25.0
-HUNT_ADJ_W = 8.0
-HUNT_ENDGAME_LEN = 3
-CORRIDOR_PEN = 8.0
-CORRIDOR_MIN = 2
-ENDGAME_ROUND = 400
-ENDGAME_SPACE_MULT = 2.0
-ENDGAME_PORTAL_PEN = 40.0
-SCOUT_ROUND = 50
-
-# ==========================================
 # UPGRADED SONAR PROTOCOL
 # ==========================================
 # Payload structure: [8 bits X] [8 bits Y] [8 bits Type] [8 bits Signature]
+SECRET_KEY = 0b10101010101010101010101010101010
 SONAR_SIG = 0xAA
 MSG_PEARL = 1
 MSG_THREAT = 2
@@ -95,7 +44,7 @@ def process_sonar() -> None:
                 
             elif msg_type == MSG_THREAT:
                 # Treat the coordinate as a highly dangerous obstacle for 5 rounds
-                others[idx] = rnd + 3 
+                others[idx] = rnd + THREAT_TTL 
 
 def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int) -> None:
     """Packs coordinates and a message type into a 32-bit integer for broadcast."""
@@ -123,9 +72,15 @@ others = {}
 heads = {}           
 seg_count = {}       
 mates_near = set()   
+mate_ids = set()
 visits = {}
 traj = []
 LAST_ROW = 0
+birth_round = -1     # King system: first round this dragon was observed
+splits_done = 0      # King system: deliberate splits made by this dragon
+
+def is_anchor():
+    return ANCHOR_ENABLE and 0 <= birth_round <= ANCHOR_BORN_BY
 
 def setup():
     global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW
@@ -206,9 +161,7 @@ def observe():
     heads.clear()
     seg_count.clear()
     mates_near.clear()
-
-    visible_pearls = 0
-    pearl_coords = []
+    mate_ids.clear()
 
     for t in ct.get_tiles():
         p = t.get_position()
@@ -218,8 +171,6 @@ def observe():
         ptime[idx] = t.get_pearl_time()
         if t.has_pearl():
             pearls[idx] = rnd
-            visible_pearls += 1
-            pearl_coords.append((p.x, p.y))
         else:
             pearls.pop(idx, None)
         part = t.get_dragon()
@@ -230,11 +181,9 @@ def observe():
             enemy = part.get_team() != my_team
             if not enemy:
                 mates_near.add(idx)
+                mate_ids.add(pid)
             if part.is_head():
                 heads[idx] = (enemy, pid, DIR_OF[part.get_dir()])
-                # Warn team if an enemy is significantly larger
-                if enemy and seg_count.get(pid, 0) > ct.get_length() + 8:
-                    send_encrypted_sonar(p.x, p.y, MSG_THREAT)
         elif idx in others:
             del others[idx]
         edges = t._edges
@@ -254,11 +203,6 @@ def observe():
                 ends = portal_ends.setdefault(pid, [])
                 if (k, i) not in ends:
                     ends.append((k, i))
-
-    # Sonar Broadcast: Only ping if we find a cluster, acting as a dinner bell for the swarm
-    if visible_pearls >= MIN_PEARL_CLUSTER and rng.random() < 0.2:
-        # Ping the coordinate of the first pearl in the cluster
-        send_encrypted_sonar(pearl_coords[0][0], pearl_coords[0][1], MSG_PEARL)
 
 def build_blockers():
     rnd = game.get_round_num()
@@ -330,7 +274,7 @@ def search(head, blocked, vacate, targets=()):
     get = vacate.get
 
     # Pre-calculate early-game portal gravity (Massive pull before round 50)
-    curiosity_pull = (PEARL_W * PORTAL_SCOUT_MULT) if rnd < SCOUT_ROUND else 0
+    curiosity_pull = (PEARL_W * PORTAL_SCOUT_MULT) if rnd < SCOUT_ROUNDS else 0
 
     while q and expanded < SEARCH_NODES:
         idx, first, dist = pop()
@@ -397,7 +341,10 @@ def around_heads():
         out.update(nbrs(hidx))
     return out
 
-def hunt_prey(length, units, rnd, mates_xy=None):
+def hunt_prey(length, units, rnd, mates_xy=None, anchor=False):
+    if anchor and not ANCHOR_HUNT:
+        return (), (), ()
+
     if not HUNT_ENABLE or not heads or units < HUNT_MIN_UNITS or units < 2:
         return (), (), ()
     maxlen = HUNT_MAX_LEN
@@ -424,7 +371,7 @@ def hunt_prey(length, units, rnd, mates_xy=None):
                 # Wrapped Manhattan distance
                 dx = min(abs(mx - ex), WID - abs(mx - ex))
                 dy = min(abs(my - ey), HEI - abs(my - ey))
-                if (dx + dy) <= 4:
+                if (dx + dy) <= HUNT_GUARD_DIST:
                     is_threat_to_team = True
                     break
         
@@ -468,6 +415,34 @@ def corridor_pen(j, head, vacate):
             free += 1
     return CORRIDOR_PEN * (CORRIDOR_MIN - free) if free < CORRIDOR_MIN else 0.0
 
+def dead_end(j, head):
+    # True if j lies in a small acyclic pocket reachable only through head (certain death).
+    seen = {head, j}
+    stack = [j]
+    nodes = 0
+    half = 0
+    while stack:
+        x = stack.pop()
+        nodes += 1
+        if nodes > DEADEND_MAX:
+            return False
+        for d in range(4):
+            if step(x, d) == -2:
+                return False
+        for y in nbrs(x):
+            if y == head:
+                continue
+            half += 1
+            if y not in seen:
+                seen.add(y)
+                stack.append(y)
+    return half // 2 <= nodes - 1
+
+def is_long(length, rnd):
+    if not LONG_ENABLE or rnd < LONG_ROUND:
+        return False
+    return is_anchor() or length >= LONG_MIN_LEN
+
 def mates_within2(idx):
     n = 0
     x, y = idx % WID, idx // WID
@@ -475,9 +450,35 @@ def mates_within2(idx):
         mx, my = m % WID, m // WID
         dx = min((mx - x) % WID, (x - mx) % WID)
         dy = min((my - y) % HEI, (y - my) % HEI)
-        if dx <= 2 and dy <= 2:
+        if dx <= TEAM_NEAR_RADIUS and dy <= TEAM_NEAR_RADIUS:
             n += 1
     return n
+
+def wdist(a, b):
+    ax, ay, bx, by = a % WID, a // WID, b % WID, b // WID
+    dx = abs(ax - bx); dy = abs(ay - by)
+    return min(dx, WID - dx) + min(dy, HEI - dy)
+
+def is_king(length, rnd):
+    if not KP_ENABLE or rnd < KP_ROUND or length < KP_MIN_LEN:
+        return False
+    for pid in mate_ids:
+        if seg_count.get(pid, 0) > length:
+            return False
+    return True
+
+def cash_target(length, rnd):
+    """Cash-in: (king head idx, king facing) of a visible much longer friendly dragon, else None."""
+    if not CASH_ENABLE or rnd < CASH_ROUND or length > CASH_MAXLEN:
+        return None
+    best, bl = None, 0
+    for hidx, (enemy, pid, hd) in heads.items():
+        if enemy:
+            continue
+        l = seg_count.get(pid, 0)
+        if l >= CASH_KING_MIN and l >= 2 * length and l > bl:
+            best, bl = (hidx, hd), l
+    return best
 
 def choose():
     head = traj[-1]
@@ -489,22 +490,49 @@ def choose():
     endgame = rnd >= ENDGAME_ROUND
 
     margin = SPACE_MARGIN * ENDGAME_SPACE_MULT if endgame else SPACE_MARGIN
-    
-    need = min(int(2 * length + margin), SPACE_CAP)
+
+    anchor = is_anchor()
+    protect = is_long(length, rnd)
+    if anchor or protect:
+        margin *= ANCHOR_SPACE_MULT
+    pmult = ANCHOR_PORTAL_MULT if (anchor or protect) else 1.0
+    head_risk = HEAD_RISK * ANCHOR_HEAD_MULT if (anchor or protect) else HEAD_RISK
+    if protect and rnd >= LONG_SAFE_ROUND:
+        head_risk *= LONG_SAFE_HEAD_MULT
+        margin *= LONG_SAFE_SPACE_MULT
+    need = min(int(SPACE_LEN_MULT * length + margin), SPACE_CAP)
 
     mates_xy = [(m % WID, m // WID) for m in mates_near] if mates_near else None
-    prey, prey_ids, intercepts = hunt_prey(length, units, rnd, mates_xy)
+    prey, prey_ids, intercepts = hunt_prey(length, units, rnd, mates_xy, anchor or protect)
     pearl_val, unknown, hunt_dist = search(head, blocked, vacate, intercepts)
+
+    king = is_king(length, rnd)
+    ehs = [h for h, (en, _, _) in heads.items() if en] if (KP_ENABLE or NEAR2_ENABLE) else []
+    edist = [99] * 4
+    if ehs:
+        for d in range(4):
+            j = step(head, d)
+            if j >= 0:
+                edist[d] = min(wdist(j, h) for h in ehs)
+    if protect and LONG_PEARL_MULT != 1.0:
+        if KP_ENABLE:
+            pearl_val = [v * LONG_PEARL_MULT if edist[d] > 3 else v for d, v in enumerate(pearl_val)]
+        else:
+            pearl_val = [v * LONG_PEARL_MULT for v in pearl_val]
+    if king:
+        pearl_val = [min(v, KP_PEARL_CAP) if edist[d] <= 3 else v for d, v in enumerate(pearl_val)]
+    ctgt = cash_target(length, rnd) if not king else None
+
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
 
     # Early-Game Fan Out OR Hub Crowd Control
-    if rnd < 20:
-        dynamic_team_pen = TEAM_NEAR_PEN * 5.0
+    if rnd < FANOUT_ROUNDS:
+        dynamic_team_pen = TEAM_NEAR_PEN * FANOUT_TEAM_MULT
     else:
         # If 3 or more teammates are loitering in the same area, aggressively push them apart
         # This prevents collateral crashes while camping hubs
-        dynamic_team_pen = TEAM_NEAR_PEN * (3.5 if len(mates_near) >= 3 else 1.0)
+        dynamic_team_pen = TEAM_NEAR_PEN * (CROWD_TEAM_MULT if len(mates_near) >= CROWD_MATES else 1.0)
 
     best_d, best_s = None, -1e18
     for d in range(4):
@@ -513,14 +541,14 @@ def choose():
             continue
         if j == -2:
             # Extreme Curiosity: A blind portal must explicitly outscore an adjacent pearl
-            if rnd < SCOUT_ROUND:
+            if rnd < SCOUT_ROUNDS:
                 s = (PEARL_W * PORTAL_SCOUT_MULT) + rng.random()
             else:
-                # Gradual Paranoia: Ramp up the penalty steadily from round 50 to 250
-                curiosity_factor = min((rnd - 50) / 200.0, 1.0) 
-                s = -(PORTAL_UNKNOWN_PEN * curiosity_factor) + rng.random()
+                # Gradual Paranoia: Ramp up the penalty steadily from round 100 to 250
+                curiosity_factor = min((rnd - SCOUT_ROUNDS) / PORTAL_PARANOIA_RAMP, 1.0) 
+                s = -(PORTAL_UNKNOWN_PEN * curiosity_factor * pmult) + rng.random()
                 
-            if endgame: s -= ENDGAME_PORTAL_PEN
+            if endgame: s -= ENDGAME_PORTAL_PEN * pmult
         else:
             # Mandatory survival check MUST happen before hunting
             if not passable(j, 1, blocked, vacate):
@@ -534,14 +562,14 @@ def choose():
             # Portal Traversal Logic
             if j != nb(head, d):
                 
-                s -= PORTAL_PEN
-                if endgame: s -= ENDGAME_PORTAL_PEN
+                s -= PORTAL_PEN * pmult
+                if endgame: s -= ENDGAME_PORTAL_PEN * pmult
                 
                 # Progressive Staleness: The longer it has been since we checked the exit, the riskier it gets
                 staleness = rnd - seen_round[j]
                 if staleness > 2:
                     # Penalty slowly builds over time up to the maximum stale cap
-                    s -= min(PORTAL_STALE_PEN, staleness * 0.8)
+                    s -= min(PORTAL_STALE_PEN, staleness * PORTAL_STALE_RATE) * pmult
             s -= corridor_pen(j, head, vacate)
             if prey_ids and hunt_dist[d] < (1 << 20):
                 s += HUNT_W / (1.0 + hunt_dist[d])
@@ -560,42 +588,91 @@ def choose():
                 if enemy and eid in prey_ids:
                     s += HUNT_ADJ_W
                 else:
-                    s -= HEAD_RISK
+                    s -= head_risk
 
             if j in cut: s -= TEAM_CUT_PEN
             if mates_near: s -= dynamic_team_pen * mates_within2(j)
             s += EXPLORE_W * unknown[d] / SEARCH_NODES
             s -= VISIT_PEN * visits.get(j, 0)
             if d == facing: s += STRAIGHT_BONUS
-            s += rng.random() * 0.3
+            if ehs:
+                ed = edist[d]
+                if king:
+                    if ed <= 1:
+                        s -= LETHAL_PEN
+                    elif ed <= 3:
+                        s -= KP_NEAR_PEN * (4 - ed)
+                    s -= KP_FAR_W * sum(1.0 / max(1, wdist(j, h)) for h in ehs)
+                elif NEAR2_ENABLE and length >= 5 and ed == 2:
+                    s -= NEAR2_PEN * length
+            if FF_ENABLE:
+                for enemy, _, _ in head_threats(j):
+                    if not enemy:
+                        s -= FF_PEN
+            if ctgt is not None:
+                kh, kd = ctgt
+                if j == step(kh, kd) or wdist(j, kh) <= 1:
+                    s -= LETHAL_PEN
+                else:
+                    s += CASH_W / (1.0 + wdist(j, kh))
+            s += rng.random() * NOISE_W
         
         if s > best_s:
             best_s, best_d = s, d
     return best_d
 
+def unit_cap():
+    if UNIT_AREA <= 0:
+        return MAX_UNITS
+    return min(MAX_UNITS, max(UNIT_MIN, (WID * HEI) // UNIT_AREA))
+
 def maybe_split():
+    global splits_done
     length = ct.get_length()
     units = ct.get_unit_count()
     rnd = game.get_round_num()
     
-    # 1. Hard population cap and basic viability check
-    if units >= MAX_UNITS or length < SPLIT_AT:
+    # 1. Dynamic Hard Cap (from Version 2)
+    if units >= unit_cap():
         return False
         
-    # 2. Dynamic Strategy Flags
+    # 2. Strategy Flags
     is_endgame = rnd >= ENDGAME_ROUND
-    is_king = length >= KING_LENGTH
+    is_king = is_anchor()
     
-    # 3. The Floor Check: If the swarm is healthy, Kings and Endgame dragons refuse to split.
-    # If the swarm drops below the minimum floor, emergency splitting resumes to regain map control.
-    if (is_endgame or is_king) and units >= MIN_SWARM_UNITS:
+    # Optional safety from Version 2
+    if is_long(length, rnd):
+        return False
+
+    # 3. King / Anchor Economy
+    if is_king:
+        # Emergency Floor Check (from Version 1): Kings MUST split if the swarm is dying.
+        emergency = units < MIN_SWARM_UNITS
+        
+        # Standard Anchor conditions (from Version 2)
+        can_anchor_split = (splits_done < ANCHOR_SPLITS and rnd <= ANCHOR_SPLIT_UNTIL and not is_endgame)
+        
+        if not emergency and not can_anchor_split:
+            return False
+            
+        if length < ANCHOR_SPLIT_AT or not ct.can_split(ANCHOR_CHILD):
+            return False
+            
+        ct.do_split(ANCHOR_CHILD)
+        splits_done += 1
+        return True
+        
+    # 4. Standard Swarm Economy
+    if rnd > SPLIT_UNTIL or is_endgame:
+        # Standard units stop splitting late game, UNLESS the swarm floor drops
+        if units >= MIN_SWARM_UNITS:
+            return False
+            
+    if length < SPLIT_AT or not ct.can_split(CHILD_SIZE):
         return False
         
-    # 4. Physical geometry check
-    if not ct.can_split(CHILD_SIZE):
-        return False
-    
     ct.do_split(CHILD_SIZE)
+    splits_done += 1
     return True
 
 def any_safe():
@@ -613,6 +690,9 @@ def any_safe():
 # UNIFIED EXECUTION SEQUENCE
 # ==========================================
 def execute_turn():
+    global birth_round
+    if birth_round < 0:
+        birth_round = game.get_round_num()
     p = ct.get_position()
     head = p.y * WID + p.x
     if not traj or traj[-1] != head:
@@ -624,16 +704,25 @@ def execute_turn():
     
     if maybe_split():
         return
+    if CASH_ENABLE:
+        rnd = game.get_round_num()
+        ct_ = cash_target(ct.get_length(), rnd)
+        if ct_ is not None and not is_king(ct.get_length(), rnd):
+            kh, kd = ct_
+            me = traj[-1]
+            dk = wdist(me, kh)
+            if 2 <= dk <= CASH_DIST and me != step(kh, kd):
+                return  # no action -> engine suicide; pearls drop near the king
         
     d = choose()
     
     # Restored Emergency Escape Split from main_6.py
     if d is None:
         current_len = ct.get_length()
-        escape_size = current_len - 2
+        escape_size = current_len - ESCAPE_KEEP
         
         # Ensure we actually have enough length to perform this sacrifice
-        if escape_size >= 2 and ct.can_split(escape_size):
+        if escape_size >= 2 and (ANCHOR_EMERGENCY_SPLIT or not is_anchor()) and not (LONG_NO_ESPLIT and is_long(current_len, game.get_round_num())) and ct.can_split(escape_size):
             ct.output_log(f"Head doomed! Transferring {escape_size} length to escaping tail.")
             ct.do_split(escape_size)
             return
