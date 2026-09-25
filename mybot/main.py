@@ -16,13 +16,15 @@ DEBUG = False
 # UPGRADED SONAR PROTOCOL
 # ==========================================
 # Payload structure: [8 bits X] [8 bits Y] [8 bits Type] [8 bits Signature]
-SECRET_KEY = 0b10101010101010101010101010101010
+SECRET_KEY = 0xAAAAAAAAAAAAAAAA
 SONAR_SIG = 0xAA
 MSG_PEARL = 1
 MSG_THREAT = 2
 MSG_KING = 3
+MSG_SPAWN = 4
 
 king_beacons = {}
+king_lengths = {}  # Tracks {dragon_id: (round_seen, true_length)}
 
 def process_sonar() -> None:
     """Reads decrypts broadcasts and injects them directly into V3 memory arrays."""
@@ -31,36 +33,43 @@ def process_sonar() -> None:
     for msg in ct.get_sonar_messages():
         decrypted = msg ^ SECRET_KEY
         
-        # Verify our unique team signature byte
         if (decrypted & 0xFF) == SONAR_SIG:
             x = (decrypted >> 24) & 0xFF
             y = (decrypted >> 16) & 0xFF
             msg_type = (decrypted >> 8) & 0xFF
+            sender_len = (decrypted >> 32) & 0xFFFF  # Unpack the length
+            timer = (decrypted >> 48) & 0xFFFF  # Unpack the exact spawn timer
             
-            # Convert 2D coordinates into V3's 1D index
             idx = y * WID + x
             
             if msg_type == MSG_PEARL:
-                # Inject a phantom pearl into the local memory
                 pearls[idx] = rnd
                 seen_round[idx] = rnd
-                
             elif msg_type == MSG_THREAT:
-                # Treat the coordinate as a highly dangerous obstacle for 5 rounds
                 others[idx] = rnd + THREAT_TTL 
-
             elif msg_type == MSG_KING:
-                # Store the king's location and round of detection
-                king_beacons[idx] = rnd
+                # Store both the round and the sender's length for the compass
+                king_beacons[idx] = (rnd, sender_len)
+                # Map the true length to the Dragon ID to pierce the fog of war
+                king_lengths[timer] = (rnd, sender_len)
+            elif msg_type == MSG_SPAWN:
+                # Triggers the BFS spawn logic by injecting a default 30-round countdown
+                seen_round[idx] = rnd
+                ptime[idx] = timer
 
     # Clean up stale beacons (older than 10 rounds)
     for k in list(king_beacons.keys()):
-        if rnd - king_beacons[k] > 10:
+        if rnd - king_beacons[k][0] > 10:
             del king_beacons[k]
 
-def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int) -> None:
-    """Packs coordinates and a message type into a 32-bit integer for broadcast."""
-    message = (target_x << 24) | (target_y << 16) | (msg_type << 8) | SONAR_SIG
+    # Clean up stale ID lengths
+    for k in list(king_lengths.keys()):
+        if rnd - king_lengths[k][0] > 10:
+            del king_lengths[k]
+
+def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int, length: int = 0, timer: int = 0) -> None:
+    """Packs coordinates, message type, length, and spawn timer into a 64-bit integer."""
+    message = (timer << 48) | (length << 32) | (target_x << 24) | (target_y << 16) | (msg_type << 8) | SONAR_SIG
     encrypted = message ^ SECRET_KEY
     for d in DIRS:
         ct.send_sonar(d, encrypted)
@@ -82,8 +91,9 @@ seen_round = []
 ptime = []
 pearls = {}
 others = {}          
-heads = {}           
-seg_count = {}       
+heads = {}
+seg_count = {}
+bodies = {}          # enemy id -> {idx: facing} for every visible segment (trap estimates)
 mates_near = set()   
 mate_ids = set()
 visits = {}
@@ -173,6 +183,7 @@ def observe():
     my_team = ct.get_team()
     heads.clear()
     seg_count.clear()
+    bodies.clear()
     mates_near.clear()
     mate_ids.clear()
 
@@ -195,6 +206,8 @@ def observe():
             if not enemy:
                 mates_near.add(idx)
                 mate_ids.add(pid)
+            else:
+                bodies.setdefault(pid, {})[idx] = DIR_OF[part.get_dir()]
             if part.is_head():
                 heads[idx] = (enemy, pid, DIR_OF[part.get_dir()])
         elif idx in others:
@@ -323,6 +336,17 @@ def search(head, blocked, vacate, targets=()):
         for j in nbrs(idx):
             if j in seen or nd < get(j, 0):
                 continue
+
+            # BLIND WRAP PREVENTION: Did we just wrap across the map?
+            # A normal step changes X or Y by exactly 1. A wrap changes it by (WID-1) or (HEI-1).
+            ix, iy = idx % WID, idx // WID
+            jx, jy = j % WID, j // WID
+            
+            if abs(ix - jx) > 1 or abs(iy - jy) > 1:
+                # If we wrapped through the map boundary into unmapped fog, reject the path
+                if seen_round[j] < 0:
+                    continue
+
             seen.add(j)
             push((j, first, nd))
     return best, unknown, tdist
@@ -355,27 +379,29 @@ def around_heads():
     return out
 
 def hunt_prey(length, units, rnd, mates_xy=None, anchor=False):
+    """Returns (prey tiles to step on, prey ids, intercept tiles to path toward,
+    sprint targets as [(head idx, visible segs)])."""
     if anchor and not ANCHOR_HUNT:
-        return (), (), ()
+        return (), (), (), ()
 
     if not HUNT_ENABLE or not heads or units < HUNT_MIN_UNITS or units < 2:
-        return (), (), ()
+        return (), (), (), ()
     maxlen = HUNT_MAX_LEN
     if rnd >= ENDGAME_ROUND and HUNT_ENDGAME_LEN < maxlen:
         maxlen = HUNT_ENDGAME_LEN
     if length > maxlen:
-        return (), (), ()
+        return (), (), (), ()
 
     me = ct.get_id()
     fill = HUNT_WINDOW_FRAC * 49.0
-    prey, ids, inter = set(), set(), set()
+    prey, ids, inter, targets = set(), set(), set(), []
     for hidx, (enemy, eid, hd) in heads.items():
         if not enemy:
             continue
-            
+
         segs = seg_count.get(eid, 0)
         j = step(hidx, hd)
-        
+
         # Bodyguard Check: Is the enemy about to step onto a friendly segment?
         is_threat_to_team = (j in mates_near)
         if not is_threat_to_team and mates_xy:
@@ -387,38 +413,122 @@ def hunt_prey(length, units, rnd, mates_xy=None, anchor=False):
                 if (dx + dy) <= HUNT_GUARD_DIST:
                     is_threat_to_team = True
                     break
-        
-        # Standard hunting restrictions are bypassed if a teammate is in immediate danger
-        if not is_threat_to_team:
-            if length > maxlen:
-                continue
 
-            if segs <= length:
+        # Standard hunting restrictions are bypassed if a teammate is in immediate danger,
+        # but a head-on never trades us for a smaller enemy.
+        if is_threat_to_team:
+            if segs < length:
                 continue
-            if segs < HUNT_MIN_ENEMY_SEGS and segs < fill:
-                continue
-                
+        elif segs <= length or (segs < HUNT_MIN_ENEMY_SEGS and segs < fill):
+            continue
+
         ids.add(eid)
+        # Vision is live, so its current head is a guaranteed head-on (sprint_attack takes it).
+        targets.append((hidx, segs))
+        # Close in on the head itself so it falls within sprint reach
+        inter.update(nbrs(hidx))
         if j >= 0:
             inter.add(j)
 
-        # ID CHECK: Only step on current head tile if enemy has ALREADY moved
-        if eid < me:
-            prey.add(hidx)
-        else:
+        if eid > me and j >= 0:
             # Enemy moves after us; step onto their destination to force a crash
-            if j >= 0:
-                prey.add(j)
-                
-                # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
-                for flank_dir in range(4):
-                    # Ignore directly ahead and directly behind their facing
-                    if flank_dir != hd and flank_dir != DIR_OF[Direction(DIRS[hd]).get_opposite()]:
-                        flank_tile = step(j, flank_dir)
-                        if flank_tile >= 0:
-                            inter.add(flank_tile)
+            prey.add(j)
 
-    return prey, ids, inter
+            # Flank Trapping: Add adjacent tiles to 'inter' to pressure their pathing
+            for flank_dir in range(4):
+                # Ignore directly ahead and directly behind their facing
+                if flank_dir != hd and flank_dir != (hd + 2) % 4:
+                    flank_tile = step(j, flank_dir)
+                    if flank_tile >= 0:
+                        inter.add(flank_tile)
+
+    return prey, ids, inter, targets
+
+def sprint_attack():
+    """Sprint head-first into an eligible enemy head reachable this turn. Both die; returns True if sent."""
+    if not SPRINT_ENABLE:
+        return False
+    length = ct.get_length()
+    rnd = game.get_round_num()
+    mates_xy = [(m % WID, m // WID) for m in mates_near] if mates_near else None
+    anchor = is_anchor() or is_long(length, rnd)
+    _, _, _, targets = hunt_prey(length, ct.get_unit_count(), rnd, mates_xy, anchor)
+    if not targets:
+        return False
+
+    # x steps cost x - 1 segments; the head-on kills us anyway, so spend everything but the last one
+    reach = length - 1
+    goal = dict(targets)
+    head = traj[-1]
+    blocked, vacate = build_blockers()
+    prev = {head: None}
+    q = deque([(head, 0)])
+    found = []
+    while q:
+        idx, dpt = q.popleft()
+        if dpt >= reach:
+            continue
+        for d in range(4):
+            j = step(idx, d)
+            if j < 0 or j in prev:
+                continue
+            if j in goal:
+                prev[j] = (idx, d)
+                found.append(j)
+            elif passable(j, dpt + 1, blocked, vacate):
+                prev[j] = (idx, d)
+                q.append((j, dpt + 1))
+    if not found:
+        return False
+
+    # Biggest prey first; BFS order already makes the first of equal size the shortest
+    tgt = max(found, key=lambda h: goal[h])
+    path = []
+    cur = tgt
+    while prev[cur] is not None:
+        cur, d = prev[cur]
+        path.append(DIRS[d])
+    path.reverse()
+    if len(path) == 1:
+        ct.make_move(path[0])
+    else:
+        ct.make_moves(path)
+    return True
+
+def enemy_vacate(eid, hidx, base):
+    """base vacate map with this enemy's visible body freeing up tail-first as it moves."""
+    segs = bodies.get(eid)
+    if not segs:
+        return base
+    # Body segments face toward the next segment headward, so invert that to walk head -> tail
+    prev_of = {}
+    for s, sd in segs.items():
+        if s != hidx:
+            prev_of[step(s, sd)] = s
+    v = dict(base)
+    n = len(segs)
+    cur, k = hidx, 0
+    while cur in prev_of and k < n:
+        cur = prev_of[cur]
+        k += 1
+        # +2 not +1: room() counts the start tile as depth 1, so its first step is depth 2
+        v[cur] = n - k + 2
+    return v
+
+def trap_setup(head, vacate):
+    """[(enemy head, visible segs, its vacate map, need, room now)] for nearby enemy heads."""
+    near = []
+    for hidx, (enemy, eid, _) in heads.items():
+        if enemy and wdist(head, hidx) <= TRAP_RADIUS:
+            near.append((wdist(head, hidx), hidx, eid))
+    near.sort()
+    out = []
+    for _, hidx, eid in near[:TRAP_MAX_HEADS]:
+        n = seg_count.get(eid, 0)
+        v = enemy_vacate(eid, hidx, vacate)
+        need = min(2 * n + 4, TRAP_CAP)
+        out.append((hidx, n, v, need, room(hidx, {head}, v, need)))
+    return out
 
 def corridor_pen(j, head, vacate):
     free = 0
@@ -484,17 +594,44 @@ def is_king(length, rnd):
             return False
     return True
 
-def cash_target(length, rnd):
-    """Cash-in: (king head idx, king facing) of a visible much longer friendly dragon, else None."""
-    if not CASH_ENABLE or rnd < CASH_ROUND or length > CASH_MAXLEN:
+def cash_target(length, rnd, king):
+    """Cash-in: (king head idx, king facing) of a visible superior friendly dragon, else None."""
+    if not CASH_ENABLE or rnd < CASH_ROUND:
         return None
+
+    # COMBAT LOCKOUT: Abort suicide instantly if ANY enemy is currently visible
+    for hidx, (enemy, pid, hd) in heads.items():
+        if enemy:
+            return None
+
+    # SPATIAL LOCKOUT: Abort suicide if trapped in a claustrophobic space
+    # Dropping pearls in a dead-end forces the massive King to trap itself trying to eat them
+    blocked, vacate = build_blockers()
+    my_head = traj[-1] if traj else ct.get_position().y * WID + ct.get_position().x
+    if room(my_head, set(), vacate, 10) < 10:
+        return None
+        
     best, bl = None, 0
+    my_id = ct.get_id()
+    
     for hidx, (enemy, pid, hd) in heads.items():
         if enemy:
             continue
-        l = seg_count.get(pid, 0)
-        if l >= CASH_KING_MIN and l >= 2 * length and l > bl:
-            best, bl = (hidx, hd), l
+            
+        # 1. Read visible segments
+        physical_len = seg_count.get(pid, 0)
+        
+        # 2. Read broadcasted true length
+        broadcast_len = king_lengths.get(pid, (0, 0))[1]
+        
+        # 3. Use the absolute largest known size to bypass the fog illusion
+        l = max(physical_len, broadcast_len)
+        
+        # UNIVERSAL HIERARCHY: Yield to strictly larger dragons, OR same size but lower ID
+        if l > length or (l == length and pid < my_id):
+            if l >= CASH_KING_MIN and l > bl:
+                best, bl = (hidx, hd), l
+                
     return best
 
 def choose():
@@ -520,7 +657,7 @@ def choose():
     need = min(int(SPACE_LEN_MULT * length + margin), SPACE_CAP)
 
     mates_xy = [(m % WID, m // WID) for m in mates_near] if mates_near else None
-    prey, prey_ids, intercepts = hunt_prey(length, units, rnd, mates_xy, anchor or protect)
+    prey, prey_ids, intercepts, _ = hunt_prey(length, units, rnd, mates_xy, anchor or protect)
     pearl_val, unknown, hunt_dist = search(head, blocked, vacate, intercepts)
 
     king = is_king(length, rnd)
@@ -538,7 +675,8 @@ def choose():
             pearl_val = [v * LONG_PEARL_MULT for v in pearl_val]
     if king:
         pearl_val = [min(v, KP_PEARL_CAP) if edist[d] <= 3 else v for d, v in enumerate(pearl_val)]
-    ctgt = cash_target(length, rnd) if not king else None
+    ctgt = cash_target(length, rnd, king)
+    traps = trap_setup(head, vacate) if (TRAP_ENABLE and not king and heads) else ()
 
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
@@ -551,15 +689,20 @@ def choose():
         # This prevents collateral crashes while camping hubs
         dynamic_team_pen = TEAM_NEAR_PEN * (CROWD_TEAM_MULT if len(mates_near) >= CROWD_MATES else 1.0)
 
-    # THE ROYAL SUMMONS: Lock onto the nearest active King beacon
+    # THE RELATIVE SUMMONS: Scouts yield to massive dragons; Kings yield to bigger Kings.
     active_summon = None
     summon_dist = 9999
-    if CASH_ENABLE and rnd >= CASH_ROUND and length <= CASH_MAXLEN and king_beacons:
-        for b_idx in king_beacons:
-            d_val = wdist(head, b_idx)
-            if d_val < summon_dist:
-                summon_dist = d_val
-                active_summon = b_idx
+    
+    if CASH_ENABLE and rnd >= CASH_ROUND and king_beacons:
+        for b_idx, (b_rnd, b_len) in king_beacons.items():
+            
+            # 1. If I am a King, I yield to any King strictly larger than me
+            # 2. If I am a scout, I only suicide if they are at least double my size
+            if (king and b_len > length) or (not king and b_len >= 2 * length):
+                d_val = wdist(head, b_idx)
+                if d_val < summon_dist:
+                    summon_dist = d_val
+                    active_summon = b_idx
 
     best_d, best_s = None, -1e18
     for d in range(4):
@@ -574,8 +717,9 @@ def choose():
                 # Gradual Paranoia: Ramp up the penalty steadily from round 100 to 250
                 curiosity_factor = min((rnd - SCOUT_ROUNDS) / PORTAL_PARANOIA_RAMP, 1.0) 
                 s = -(PORTAL_UNKNOWN_PEN * curiosity_factor * pmult) + rng.random()
-                
-            if endgame: s -= ENDGAME_PORTAL_PEN * pmult
+
+            if endgame: 
+                s -= ENDGAME_PORTAL_PEN * pmult
         else:
             # Mandatory survival check MUST happen before hunting
             if not passable(j, 1, blocked, vacate):
@@ -593,23 +737,40 @@ def choose():
 
             # Portal Traversal Logic
             if j != nb(head, d):
+                raw_pen = PORTAL_PEN * pmult
+                if endgame: raw_pen += ENDGAME_PORTAL_PEN * pmult
                 
-                s -= PORTAL_PEN * pmult
-                if endgame: s -= ENDGAME_PORTAL_PEN * pmult
+                # ELASTIC ESCAPE HATCH: The richer the destination, the lower the penalty.
+                # This guarantees they will take the portal to leave an empty island, 
+                # but keeps the penalty firm if the other side is also a barren wasteland.
+                dest_val = pearl_val[d] + (EXPLORE_W * unknown[d] / SEARCH_NODES)
+                elastic_pen = max(0.0, raw_pen - (dest_val * 0.5))
                 
-                # Progressive Staleness: The longer it has been since we checked the exit, the riskier it gets
-                staleness = rnd - seen_round[j]
-                if staleness > 2:
-                    # Penalty slowly builds over time up to the maximum stale cap
-                    s -= min(PORTAL_STALE_PEN, staleness * PORTAL_STALE_RATE) * pmult
+                s -= elastic_pen
+
             s -= corridor_pen(j, head, vacate)
             if prey_ids and hunt_dist[d] < (1 << 20):
                 s += HUNT_W / (1.0 + hunt_dist[d])
             r = room(j, pessimistic, vacate, need)
+
+
             if r < need:
                 s -= (need - r) * TRAP_PEN
                 if r < length + 2:
                     s -= LETHAL_PEN
+
+            # HUB CONTEST: body hits only kill the attacker, so wall enemy heads in instead of ramming
+            for eh, en, ev, eneed, er0 in traps:
+                if wdist(j, eh) > TRAP_RADIUS - 1:
+                    continue
+                er = room(eh, {j, head}, ev, eneed)
+                if er < en <= er0:
+                    s += TRAP_KILL_W
+                elif er < er0:
+                    s += SQUEEZE_W * (er0 - er)
+
+            if DEADEND_PEN > 0 and dead_end(j, head):
+                s -= DEADEND_PEN
 
             # Emergency Desperation Bypass: If we are stepping into certain death (r < length + 2), 
             # we refund the portal penalties because jumping blindly is better than suffocating.
@@ -663,6 +824,15 @@ def maybe_split():
     length = ct.get_length()
     units = ct.get_unit_count()
     rnd = game.get_round_num()
+
+    if S_BIRTH_ENABLE:
+        # SPATIAL BIRTH CONTROL: Check if we are inside a tiny dead-end or island
+        blocked, vacate = build_blockers()
+        head = traj[-1] if traj else ct.get_position().y * WID + ct.get_position().x
+        
+        # If the local room has fewer than 20 open tiles, abort reproduction
+        if room(head, set(), vacate, 20) < 20:
+            return False
     
     # 1. Dynamic Hard Cap (from Version 2)
     if units >= unit_cap():
@@ -734,22 +904,52 @@ def execute_turn():
     observe()
     process_sonar()
 
+    if SPAWN_SONAR_ENABLE:
+        # SPAWN CLUSTER BROADCAST: Announce rich, renewable food hubs
+        rnd = game.get_round_num()
+        
+        # Identify all tiles seen THIS round that are confirmed pearl spawns
+        visible_hubs = [idx for idx, r in enumerate(seen_round) if r == rnd and ptime[idx] >= 0]
+        
+        # If we see a dense cluster of spawns, ping the exact coordinates of one of them
+        if len(visible_hubs) >= MIN_PEARL_CLUSTER and rng.random() < SONAR_PING_PROB:
+            center_idx = visible_hubs[0]
+            hx, hy = center_idx % WID, center_idx // WID
+            
+            # Calculate average timer, explicitly treating physical pearls as a 0-round wait
+            total_time = 0
+            for i in visible_hubs:
+                if pearls.get(i) == rnd:
+                    total_time += 0  # Food is here right now
+                else:
+                    total_time += ptime[i]
+                    
+            avg_timer = total_time // len(visible_hubs)
+            send_encrypted_sonar(hx, hy, MSG_SPAWN, length=0, timer=avg_timer)
+
     # THE ROYAL BROADCAST: Kings fire 4-way raycasts to summon scouts
     if CASH_ENABLE and game.get_round_num() >= CASH_ROUND:
-        if is_king(ct.get_length(), game.get_round_num()) and rng.random() < 0.2:
-            send_encrypted_sonar(p.x, p.y, MSG_KING)
+        my_len = ct.get_length()
+        if is_king(my_len, game.get_round_num()) and rng.random() < SONAR_PING_PROB:
+            # Pack ct.get_id() into the 16-bit 'timer' slot of the payload
+            send_encrypted_sonar(p.x, p.y, MSG_KING, length=my_len, timer=ct.get_id())
     
+    if sprint_attack():
+        return
     if maybe_split():
         return
     if CASH_ENABLE:
         rnd = game.get_round_num()
-        ct_ = cash_target(ct.get_length(), rnd)
-        if ct_ is not None and not is_king(ct.get_length(), rnd):
+        my_len = ct.get_length()
+        am_king = is_king(my_len, rnd)
+        
+        ct_ = cash_target(my_len, rnd, am_king)
+        if ct_ is not None:
             kh, kd = ct_
             me = traj[-1]
             dk = wdist(me, kh)
             if 2 <= dk <= CASH_DIST and me != step(kh, kd):
-                return  # no action -> engine suicide; pearls drop near the king
+                return  # no action -> engine suicide; pearls drop near the superior dragon
         
     d = choose()
     
