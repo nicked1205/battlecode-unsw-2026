@@ -22,9 +22,13 @@ MSG_PEARL = 1
 MSG_THREAT = 2
 MSG_KING = 3
 MSG_SPAWN = 4
+MSG_HUB = 5
 
 king_beacons = {}
 king_lengths = {}  # Tracks {dragon_id: (round_seen, true_length)}
+hub_beacons = {}   # HUB SONAR: patch tile -> (round heard, value, contested)
+hub_relays = []    # beacons heard this turn that we pass on once
+hub_relayed = set()
 
 def process_sonar() -> None:
     """Reads decrypts broadcasts and injects them directly into V3 memory arrays."""
@@ -56,23 +60,53 @@ def process_sonar() -> None:
                 # Triggers the BFS spawn logic by injecting a default 30-round countdown
                 seen_round[idx] = rnd
                 ptime[idx] = timer
+            elif msg_type == MSG_HUB and HUB_SONAR_ENABLE:
+                value, contested, hops = sender_len & 0xFF, (sender_len >> 8) & 1, (sender_len >> 9) & 7
+                old = hub_beacons.get(idx)
+                if old is None or old[0] < rnd or value > old[1]:
+                    hub_beacons[idx] = (rnd, value, contested)
+                # A ray only reaches the first dragon on its line, so pass it on once
+                key = (idx, rnd // HUB_TTL)
+                if hops > 0 and key not in hub_relayed:
+                    hub_relayed.add(key)
+                    hub_relays.append((x, y, value | (contested << 8) | ((hops - 1) << 9)))
 
     # Clean up stale beacons (older than 10 rounds)
     for k in list(king_beacons.keys()):
         if rnd - king_beacons[k][0] > 10:
             del king_beacons[k]
 
+    for k in list(hub_beacons.keys()):
+        if rnd - hub_beacons[k][0] > HUB_TTL:
+            del hub_beacons[k]
+    if len(hub_relayed) > 256:
+        hub_relayed.clear()
+
     # Clean up stale ID lengths
     for k in list(king_lengths.keys()):
         if rnd - king_lengths[k][0] > 10:
             del king_lengths[k]
 
-def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int, length: int = 0, timer: int = 0) -> None:
+# Only the last sonar sent in each direction is cast, so queue them and keep the most important
+# message per direction; flush_sonar() sends the lot at the end of the turn (the engine casts
+# them after our action anyway). A ray aimed into our own body leaves through the tail.
+SONAR_RALLY, SONAR_KING, SONAR_RELAY, SONAR_BEACON = 4, 3, 2, 1
+sonar_out = {}   # direction -> (priority, message)
+
+def send_encrypted_sonar(target_x: int, target_y: int, msg_type: int, length: int = 0, timer: int = 0,
+                         priority: int = SONAR_BEACON) -> None:
     """Packs coordinates, message type, length, and spawn timer into a 64-bit integer."""
     message = (timer << 48) | (length << 32) | (target_x << 24) | (target_y << 16) | (msg_type << 8) | SONAR_SIG
     encrypted = message ^ SECRET_KEY
-    for d in DIRS:
-        ct.send_sonar(d, encrypted)
+    for d in range(4):
+        cur = sonar_out.get(d)
+        if cur is None or priority > cur[0]:
+            sonar_out[d] = (priority, encrypted)
+
+def flush_sonar() -> None:
+    for d, (_, msg) in sonar_out.items():
+        ct.send_sonar(DIRS[d], msg)
+    sonar_out.clear()
 
 # ==========================================
 # V3 1D PATHFINDING ENGINE
@@ -95,20 +129,28 @@ heads = {}
 seg_count = {}
 bodies = {}          # enemy id -> {idx: facing} for every visible segment (trap estimates)
 mates_near = set()   
+vis_pearls = []      # HUB SONAR: pearl tiles in view this turn
+vis_soon = 0         # HUB SONAR: empty tiles in view spawning within HUB_SOON rounds
 mate_ids = set()
 visits = {}
 traj = []
 LAST_ROW = 0
 birth_round = -1     # King system: first round this dragon was observed
 splits_done = 0      # King system: deliberate splits made by this dragon
+# search() seeds its first moves in this order, and a tile tied between two first moves is
+# credited to the earlier one, so the order tilts exploration. Set at birth (see execute_turn).
+seed_order = (0, 1, 2, 3)
 
 def is_anchor():
     return ANCHOR_ENABLE and 0 <= birth_round <= ANCHOR_BORN_BY
 
 def setup():
-    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW
+    global WID, HEI, hedge, vedge, seen_round, ptime, LAST_ROW, MAX_UNITS, MIN_SWARM_UNITS
     WID, HEI = game.get_map_size()
     n = WID * HEI
+    # Big maps have room (and pearls) for a bigger swarm; rebinds the params imported above
+    if n > BIG_MAP_AREA:
+        MAX_UNITS, MIN_SWARM_UNITS = BIG_MAX_UNITS, BIG_MIN_SWARM_UNITS
     LAST_ROW = (HEI - 1) * WID
     hedge = [0] * n
     vedge = [0] * n
@@ -178,6 +220,7 @@ def nbrs(idx):
     return out
 
 def observe():
+    global vis_soon
     rnd = game.get_round_num()
     me = ct.get_id()
     my_team = ct.get_team()
@@ -186,6 +229,8 @@ def observe():
     bodies.clear()
     mates_near.clear()
     mate_ids.clear()
+    vis_pearls.clear()
+    soon = 0
 
     for t in ct.get_tiles():
         p = t.get_position()
@@ -195,8 +240,11 @@ def observe():
         ptime[idx] = t.get_pearl_time()
         if t.has_pearl():
             pearls[idx] = rnd
+            vis_pearls.append(idx)
         else:
             pearls.pop(idx, None)
+            if 0 <= ptime[idx] <= HUB_SOON:
+                soon += 1
         part = t.get_dragon()
         if part is not None and part.get_id() != me:
             others[idx] = rnd
@@ -229,6 +277,7 @@ def observe():
                 ends = portal_ends.setdefault(pid, [])
                 if (k, i) not in ends:
                     ends.append((k, i))
+    vis_soon = soon
 
 def build_blockers():
     rnd = game.get_round_num()
@@ -281,14 +330,15 @@ def room(start, extra_blocked, vacate, need):
             push((j, depth))
     return count
 
-def search(head, blocked, vacate, targets=()):
+def search(head, blocked, vacate, targets=(), targets2=()):
     rnd = game.get_round_num()
     best = [0.0] * 4
     unknown = [0] * 4
     tdist = [1 << 20] * 4
+    t2dist = [1 << 20] * 4
     seen = {head}
     q = deque()
-    for d in range(4):
+    for d in seed_order:
         j = step(head, d)
         if j in seen or not passable(j, 1, blocked, vacate):
             continue
@@ -307,6 +357,8 @@ def search(head, blocked, vacate, targets=()):
         expanded += 1
         if idx in targets and dist < tdist[first]:
             tdist[first] = dist
+        if idx in targets2 and dist < t2dist[first]:
+            t2dist[first] = dist
 
         # DISTANT PORTAL GRAVITY: Pull scouts toward portals before round 50
         if curiosity_pull > 0:
@@ -349,7 +401,7 @@ def search(head, blocked, vacate, targets=()):
 
             seen.add(j)
             push((j, first, nd))
-    return best, unknown, tdist
+    return best, unknown, tdist, t2dist
 
 def head_threats(idx):
     out = []
@@ -658,7 +710,20 @@ def choose():
 
     mates_xy = [(m % WID, m // WID) for m in mates_near] if mates_near else None
     prey, prey_ids, intercepts, _ = hunt_prey(length, units, rnd, mates_xy, anchor or protect)
-    pearl_val, unknown, hunt_dist = search(head, blocked, vacate, intercepts)
+    # HUB RALLY: head for a food patch a teammate announced (harder if it is contested),
+    # unless we are already on food or are the king
+    hub_t = None
+    if HUB_SONAR_ENABLE and hub_beacons and len(vis_pearls) + 0.5 * vis_soon < HUB_MIN_SCORE and not is_king(length, rnd):
+        for b, (br, bv, bc) in hub_beacons.items():
+            d0 = wdist(head, b)
+            if d0 <= 2 or d0 > HUB_RANGE:
+                continue
+            val = (HUB_RALLY_W if bc else HUB_W) * bv / (bv + 8.0) / (1.0 + d0 / 8.0)
+            if hub_t is None or val > hub_t[0]:
+                hub_t = (val, b, d0)
+    hub_zone = (set(nbrs(hub_t[1])) | {hub_t[1]}) if hub_t else ()
+    pearl_val, unknown, hunt_dist, hub_dist = search(head, blocked, vacate, intercepts, hub_zone)
+    hub_min = min(hub_dist) if hub_t else (1 << 20)
 
     king = is_king(length, rnd)
     ehs = [h for h, (en, _, _) in heads.items() if en] if (KP_ENABLE or NEAR2_ENABLE) else []
@@ -729,6 +794,14 @@ def choose():
                 s = HUNT_KILL_W + rng.random()
             else:
                 s = pearl_val[d]
+
+            # HUB RALLY: by real path if the search reached the patch, else straight-line progress
+            if hub_t is not None:
+                if hub_min < (1 << 20):
+                    if hub_dist[d] < (1 << 20):
+                        s += hub_t[0] / (1.0 + hub_dist[d] - hub_min)
+                elif wdist(j, hub_t[1]) < hub_t[2]:
+                    s += hub_t[0]
 
             # GLOBAL COMPASS: Pull small scouts toward the raycast beacon
             if active_summon is not None:
@@ -877,6 +950,30 @@ def maybe_split():
     splits_done += 1
     return True
 
+def hub_broadcast():
+    """HUB SONAR: announce a live food patch; always (as a rally) when an enemy head is in view."""
+    score = len(vis_pearls) + 0.5 * vis_soon
+    if score < HUB_MIN_SCORE:
+        return
+    contested = any(en for en, _, _ in heads.values())
+    if not contested and rng.random() >= HUB_PING_PROB:
+        return
+    # Centre of the patch: the pearl with the most other pearls within 2 tiles
+    best, bc = traj[-1], -1
+    for i in vis_pearls:
+        ix, iy = i % WID, i // WID
+        c = 0
+        for k in vis_pearls:
+            dx = abs(k % WID - ix)
+            dy = abs(k // WID - iy)
+            if min(dx, WID - dx) <= 2 and min(dy, HEI - dy) <= 2:
+                c += 1
+        if c > bc:
+            best, bc = i, c
+    value = min(255, int(2 * score))
+    send_encrypted_sonar(best % WID, best // WID, MSG_HUB, length=value | (int(contested) << 8) | (HUB_RELAY_HOPS << 9),
+                         priority=SONAR_RALLY if contested else SONAR_BEACON)
+
 def any_safe():
     head = traj[-1]
     blocked, vacate = build_blockers()
@@ -892,9 +989,18 @@ def any_safe():
 # UNIFIED EXECUTION SEQUENCE
 # ==========================================
 def execute_turn():
-    global birth_round
+    global birth_round, seed_order
     if birth_round < 0:
         birth_round = game.get_round_num()
+        if SEED_ORDER_ENABLE:
+            # Forward, left, right, back of our starting heading: forward wins both forward
+            # diagonals, so every dragon leans straight ahead, and the other side gets the
+            # mirror image. A split child faces away from its parent, so flip it to inherit
+            # the parent's heading.
+            f = DIR_OF[ct.get_dir()]
+            if birth_round > 0 or ct.get_length() < 3:
+                f = (f + 2) % 4
+            seed_order = (f, (f + 3) % 4, (f + 1) % 4, (f + 2) % 4)
     p = ct.get_position()
     head = p.y * WID + p.x
     if not traj or traj[-1] != head:
@@ -903,6 +1009,13 @@ def execute_turn():
         
     observe()
     process_sonar()
+
+    if HUB_SONAR_ENABLE:
+        if hub_relays:
+            rx, ry, payload = hub_relays[0]
+            send_encrypted_sonar(rx, ry, MSG_HUB, length=payload, priority=SONAR_RELAY)
+            hub_relays.clear()
+        hub_broadcast()
 
     if SPAWN_SONAR_ENABLE:
         # SPAWN CLUSTER BROADCAST: Announce rich, renewable food hubs
@@ -932,7 +1045,7 @@ def execute_turn():
         my_len = ct.get_length()
         if is_king(my_len, game.get_round_num()) and rng.random() < SONAR_PING_PROB:
             # Pack ct.get_id() into the 16-bit 'timer' slot of the payload
-            send_encrypted_sonar(p.x, p.y, MSG_KING, length=my_len, timer=ct.get_id())
+            send_encrypted_sonar(p.x, p.y, MSG_KING, length=my_len, timer=ct.get_id(), priority=SONAR_KING)
     
     if sprint_attack():
         return
@@ -979,7 +1092,9 @@ def main():
         except EOFError:
             break
         try:
+            sonar_out.clear()
             execute_turn()
+            flush_sonar()
         except Exception as exc:
             if not traj:
                 p = ct.get_position()

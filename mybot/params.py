@@ -5,11 +5,26 @@ CHILD_SIZE = 2
 MAX_UNITS = 48
 KING_LENGTH = 12
 MIN_SWARM_UNITS = 24
+# Maps with area over BIG_MAP_AREA use these instead (e.g. schooltime, big_empty)
+BIG_MAP_AREA = 2000
+BIG_MAX_UNITS = 64
+BIG_MIN_SWARM_UNITS = 64
 
 # Sonar
 MIN_PEARL_CLUSTER = 3
-SONAR_PING_PROB = 0.2
+SONAR_PING_PROB = 0.5
 SPAWN_SONAR_ENABLE = 0
+# HUB SONAR: announce live food patches (rally when an enemy head is in view); teammates relay once
+# and nearby non-king dragons not already on food are pulled toward the patch.
+HUB_SONAR_ENABLE = 1
+HUB_MIN_SCORE = 4        # pearls in view + 0.5 per tile spawning within HUB_SOON
+HUB_SOON = 10
+HUB_PING_PROB = 0.2      # chance to announce an uncontested patch each turn
+HUB_RELAY_HOPS = 1
+HUB_TTL = 8
+HUB_RANGE = 24
+HUB_W = 20.0
+HUB_RALLY_W = 40.0
 
 # Movement & Heuristic Weights
 PEARL_W = 84.0
@@ -30,6 +45,8 @@ PORTAL_STALE_RATE = 0.8
 PORTAL_SCOUT_MULT = 0.7
 PORTAL_PARANOIA_RAMP = 250.0 - SCOUT_ROUNDS
 PORTAL_UNKNOWN_PEN = 20.0
+# 1 = blind-wrap check only blocks real map-edge wraps, so search can see through known portals
+PORTAL_LOOKTHROUGH = 1
 
 HEAD_RISK = 28.0
 TEAM_CUT_PEN = 150.0
@@ -43,7 +60,10 @@ CROWD_TEAM_MULT = 3.5
 LETHAL_PEN = 100.0
 LETHAL_SLACK = 2
 VISIT_PEN = 2.8
-EXPLORE_W = 8.4
+EXPLORE_W = 16.8
+# 1 = search seeds first moves as forward, left, right, back of each dragon's starting heading
+# (children: their parent's), so both sides get the same exploration tilt. 0 = fixed N,E,S,W.
+SEED_ORDER_ENABLE = 1
 STRAIGHT_BONUS = 0.5
 NOISE_W = 0.3
 OTHER_TTL = 2
