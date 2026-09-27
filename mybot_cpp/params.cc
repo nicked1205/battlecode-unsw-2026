@@ -22,6 +22,14 @@ constexpr int RESCUE_CASH_UNITS = 2;
 constexpr int BIG_MAP_AREA = 1000;
 constexpr int BIG_MAX_UNITS = 64;
 constexpr int BIG_MIN_SWARM_UNITS = 64;
+// UNIT RESERVE: normal splitting stops this many dragons below the game's unit limit, so a boxed-in dragon can
+// always make the emergency split (the engine refuses any split at the limit and the whole dragon dies: 119 long
+// dragons died that way in 60 online games). 2 won 34/59 vs 0 on the big maps.
+constexpr int UNIT_RESERVE = 2;
+// Big maps start the whole cash-in schedule this many rounds earlier (CASH_ROUND, CASH_BEACON_ROUND,
+// KING_ELECT_ROUND, KING_OPEN_ROUND); small maps keep it, since early drops there get grabbed by the enemy.
+// 40 (cash-in from 380) won 35/60 vs 0 on the big maps; the dev team's kings start feeding around round 380.
+constexpr int BIG_CASH_SHIFT = 40;
 
 // Sonar
 constexpr int MIN_PEARL_CLUSTER = 3;
@@ -58,10 +66,11 @@ constexpr double PORTAL_EXIT_VISIT_MULT = 0.0;
 // 1 = unexplored-portal penalty ramps with the dragon's own age (newborns are not afraid); 0 = game round
 constexpr int PORTAL_AGE_RAMP = 1;
 // PORTAL LENGTH FEAR: 1 = the unexplored-portal penalty ramps with length instead of game time / age:
-// none at length <= PORTAL_FEAR_MIN_LEN, full (PORTAL_UNKNOWN_PEN) from PORTAL_FEAR_FULL_LEN (0 = old ramp)
-constexpr int PORTAL_LEN_FEAR = 0;
-constexpr int PORTAL_FEAR_MIN_LEN = 3;
-constexpr int PORTAL_FEAR_FULL_LEN = 10;
+// none at length <= PORTAL_FEAR_MIN_LEN, full (PORTAL_UNKNOWN_PEN) from PORTAL_FEAR_FULL_LEN (0 = old ramp,
+// which uses PORTAL_AGE_RAMP). 2 -> 5 won 97/175 vs the old ramp on the 11 portal maps; 3 -> 10 lost 38/88.
+constexpr int PORTAL_LEN_FEAR = 1;
+constexpr int PORTAL_FEAR_MIN_LEN = 2;
+constexpr int PORTAL_FEAR_FULL_LEN = 5;
 constexpr int PORTAL_TRAFFIC_ENABLE = 1;
 constexpr int PORTAL_TAKEN_TTL = 60;
 constexpr double PORTAL_TAKEN_PEN = 60.0;
@@ -84,7 +93,7 @@ constexpr double CROWD_TEAM_MULT = 3.5;
 constexpr double LETHAL_PEN = 100.0;
 constexpr int LETHAL_SLACK = 2;  // unused
 constexpr double VISIT_PEN = 2.8;
-constexpr double EXPLORE_W = 16.8;
+constexpr double EXPLORE_W = 12.6;
 // 1 = search seeds first moves as forward, left, right, back of each dragon's starting heading
 // (children: their parent's), so both sides get the same exploration tilt. 0 = fixed N,E,S,W.
 constexpr int SEED_ORDER_ENABLE = 1;
@@ -152,7 +161,7 @@ constexpr double KP_PEARL_CAP = 70.0;
 constexpr int NEAR2_ENABLE = 1;
 constexpr double NEAR2_PEN = 3.0;
 constexpr int CASH_ENABLE = 1;
-constexpr int CASH_ROUND = 420;
+inline int CASH_ROUND = 420;
 constexpr int CASH_MAXLEN = 5;  // unused
 constexpr int CASH_KING_MIN = 6;
 constexpr int CASH_DIST = 4;
@@ -161,12 +170,12 @@ constexpr double CASH_W = 80.0;
 // per-direction outbox), scouts follow the real path to them, a king is self-elected when none is heard,
 // kings seek open ground, and scouts only cash in with a reserve left and where the king can reach the drops.
 constexpr int CASH2_ENABLE = 1;
-constexpr int CASH_BEACON_ROUND = 390;
+inline int CASH_BEACON_ROUND = 390;
 constexpr double KING_PING_PROB = 0.5;
-constexpr int KING_ELECT_ROUND = 400;
+inline int KING_ELECT_ROUND = 400;
 constexpr int KING_ELECT_SILENCE = 10;
 constexpr int KING_ELECT_MIN = 3;
-constexpr int KING_OPEN_ROUND = 380;
+inline int KING_OPEN_ROUND = 380;
 constexpr double KING_OPEN_W = 20.0;
 constexpr int KING_OPEN_CAP = 60;
 constexpr int CASH_RESERVE = 3;
@@ -180,4 +189,16 @@ constexpr double KING_HUNT_W = 40.0;
 constexpr int FF_ENABLE = 0;
 constexpr double FF_PEN = 80.0;
 
-constexpr int S_BIRTH_ENABLE = 0;
+// SPATIAL BIRTH CONTROL: no splitting when fewer than 20 tiles are free around the head (dragons block, known
+// portals count as open). vs our own bot 45/90; vs a portal-avoiding bot default 1/8 -> 4/8, queen 7/8 unchanged,
+// autarky and slithery_fight 6/8 -> 3/8.
+constexpr int S_BIRTH_ENABLE = 1;
+// S_BIRTH only applies to dragons up to this length (999 = all, the first version). Blocking long dragons turned
+// them into corridor gates stuck in a doomed-head split loop (249 per game on autarky/dilemma). vs a
+// portal-avoiding bot: 999 -> 47/88, 4 -> 54/88 (autarky 3 -> 5/8, slithery_fight 3 -> 6/8); vs our own bot ~even.
+constexpr int S_BIRTH_MAX_LEN = 4;
+// 1 = S_BIRTH only applies inside a walled-off area (kelp and portals count as walls) under S_BIRTH_POCKET_SIZE tiles,
+// e.g. default's maze cells; fountain strips and corridors that open onto the map are left alone. Without it S_BIRTH
+// lost trauma 4/30 vs S_BIRTH off (it stalls splitting at the 1-wide fountain strips); with it 16/30.
+constexpr int S_BIRTH_POCKET_ONLY = 1;
+constexpr int S_BIRTH_POCKET_SIZE = 40;

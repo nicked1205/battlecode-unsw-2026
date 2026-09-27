@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "unswbc judge (C++20, wasm32 libc++)",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "C:/Users/ncta2/AppData/Local/Programs/Python/Python312/Lib/site-packages/unswbc/clang/root/sysroot/include/c++/v1",
+                "C:/Users/ncta2/AppData/Local/Programs/Python/Python312/Lib/site-packages/unswbc/clang/root/lib/clang/20/include",
+                "C:/Users/ncta2/AppData/Local/Programs/Python/Python312/Lib/site-packages/unswbc/clang/root/sysroot/include"
+            ],
+            "defines": ["__wasi__", "__wasm__", "__wasm32__"],
+            "compilerPath": "",
+            "cStandard": "c17",
+            "cppStandard": "c++20",
+            "intelliSenseMode": "clang-x86"
+        }
+    ],
+    "version": 4
+}

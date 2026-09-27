@@ -209,6 +209,10 @@ static void setup() {
     if (NT > BIG_MAP_AREA) {
         MAX_UNITS = BIG_MAX_UNITS;
         MIN_SWARM_UNITS = BIG_MIN_SWARM_UNITS;
+        CASH_ROUND -= BIG_CASH_SHIFT;
+        CASH_BEACON_ROUND -= BIG_CASH_SHIFT;
+        KING_ELECT_ROUND -= BIG_CASH_SHIFT;
+        KING_OPEN_ROUND -= BIG_CASH_SHIFT;
     }
     LAST_ROW = (HEI - 1) * WID;
     hedge.assign(NT, 0);
@@ -312,6 +316,27 @@ static Nbrs nbrs(int idx) {
         if (j >= 0) out.push(j);
     }
     return out;
+}
+
+// POCKETS: the size of the walled-off area around start, where kelp and portals count as walls and
+// unseen edges as open, counted up to cap
+static int pocket_size(int start, int cap) {
+    gen_seen.clear();
+    gen_seen.add(start);
+    std::vector<int> q{start};
+    std::size_t qh = 0;
+    while (qh < q.size()) {
+        if (static_cast<int>(q.size()) >= cap) return cap;
+        int const i = q[qh++];
+        for (int d = 0; d < 4; d++) {
+            if (edge_state(edge_key(i, d)) != 0) continue;
+            int const j = nb(i, d);
+            if (gen_seen.has(j)) continue;
+            gen_seen.add(j);
+            q.push_back(j);
+        }
+    }
+    return static_cast<int>(q.size());
 }
 
 static int seg_of(int pid) {
@@ -1235,8 +1260,9 @@ static int choose() {
 }
 
 static int unit_cap() {
-    if (UNIT_AREA <= 0) return MAX_UNITS;
-    return std::min(MAX_UNITS, std::max(UNIT_MIN, (WID * HEI) / UNIT_AREA));
+    int const cap = UNIT_AREA <= 0 ? MAX_UNITS : std::min(MAX_UNITS, std::max(UNIT_MIN, (WID * HEI) / UNIT_AREA));
+    // UNIT RESERVE: keep slots under the game's unit limit free for emergency splits
+    return std::min(cap, game->get_unit_limit() - UNIT_RESERVE);
 }
 
 static bool maybe_split() {
@@ -1244,7 +1270,12 @@ static bool maybe_split() {
     int const units = ct->get_unit_count();
     int const rnd = rnd_now();
 
-    if (S_BIRTH_ENABLE) {
+    // Long dragons are exempt: blocking their splits in a corridor turns them into permanent gates that
+    // box themselves in (doomed-head split every other round) and block our own routes
+    // S_BIRTH_POCKET_ONLY: only inside a small walled-off area (portals count as walls), such as a maze cell;
+    // corridors and fountain strips that open onto the map are left alone
+    if (S_BIRTH_ENABLE && length <= S_BIRTH_MAX_LEN &&
+        (!S_BIRTH_POCKET_ONLY || pocket_size(traj.back(), S_BIRTH_POCKET_SIZE) < S_BIRTH_POCKET_SIZE)) {
         // SPATIAL BIRTH CONTROL: Check if we are inside a tiny dead-end or island
         std::vector<int> const vacate = build_blockers();
         // If the local room has fewer than 20 open tiles, abort reproduction
