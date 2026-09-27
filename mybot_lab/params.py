@@ -13,7 +13,7 @@ RESCUE_EVERY = 5
 RESCUE_CHILD = 2
 RESCUE_CASH_UNITS = 2
 # Maps with area over BIG_MAP_AREA use these instead (e.g. schooltime, big_empty)
-BIG_MAP_AREA = 1000
+BIG_MAP_AREA = 2000
 BIG_MAX_UNITS = 64
 BIG_MIN_SWARM_UNITS = 64
 
@@ -96,8 +96,8 @@ TRAP_ENABLE = 1
 TRAP_RADIUS = 4
 TRAP_MAX_HEADS = 1
 TRAP_CAP = 20
-TRAP_KILL_W = 60.0
-SQUEEZE_W = 2.0
+TRAP_KILL_W = 120.0
+SQUEEZE_W = 4.0
 CORRIDOR_PEN = 8.0
 CORRIDOR_MIN = 2
 ENDGAME_ROUND = 400
@@ -166,7 +166,52 @@ KING_HUNT_MAXLEN = 5
 KING_HUNT_RATIO = 2.0
 KING_HUNT_MIN = 6
 KING_HUNT_W = 40.0
+
+# ===== LAB (overnight hub-contest strategies; each tested vs the lab without it) =====
+# SPRINT DODGE: penalise moving into tiles a visible enemy could sprint into when the head-on would cost us more
+DODGE_ENABLE = 1
+DODGE_MAX_REACH = 5
+DODGE_PEN = 30.0
 FF_ENABLE = 0
 FF_PEN = 80.0
 
 S_BIRTH_ENABLE = 0
+# SPRINT GRAB: sprint up to GRAB_MAX_STEPS through visible pearls when an enemy head within GRAB_ENEMY_DIST
+# would reach one first by walking; keeps net length change >= GRAB_MIN_NET
+GRAB_ENABLE = 1
+GRAB_MAX_STEPS = 4
+GRAB_ENEMY_DIST = 6
+GRAB_MIN_NET = 0
+# VORONOI: pearl value in search x VOR_LOST_MULT if a visible enemy head walks there first, x VOR_CONTEST_MULT
+# if it gets there within VOR_WINDOW moves after us, x VOR_MATE_MULT if a visible teammate head is closer
+VOR_ENABLE = 1
+# 0 = BFS floods from enemy and teammate heads (~8M points/turn, TLEs); 1 = wrapped Manhattan distance to
+# the visible heads (cheap, ignores walls); 2 = BFS from enemy heads only (depth VOR_EDEPTH) + Manhattan for teammates
+VOR_LITE = 1
+VOR_EDEPTH = 6
+# 1 = no Voronoi on a dragon's first turn (it also pays for process start-up)
+VOR_SKIP_FIRST = 1
+VOR_DEPTH = 8
+VOR_WINDOW = 2
+VOR_LOST_MULT = 0.5
+VOR_CONTEST_MULT = 1.5
+VOR_MATE_MULT = 0.6
+# HUB RALLY (old hub sonar): a dragon seeing a food patch (pearls + 0.5 x tiles spawning within HUB_SOON
+# >= HUB_MIN_SCORE) with an enemy head in view calls teammates in; RALLY_UNCONTESTED = 1 also announces
+# uncontested patches (with HUB_PING_PROB). Relayed once; non-kings not on food within HUB_RANGE answer.
+RALLY_ENABLE = 1
+RALLY_UNCONTESTED = 0
+HUB_MIN_SCORE = 4
+HUB_SOON = 10
+HUB_PING_PROB = 0.2
+HUB_RELAY_HOPS = 1
+HUB_TTL = 8
+HUB_RANGE = 24
+HUB_W = 20.0
+HUB_RALLY_W = 40.0
+
+# SPRINT ESCAPE: if choose()'s move ends in a pocket smaller than length + 2 (or no move is safe), sprint up
+# to ESC_MAX_STEPS tiles to the nearest tile with room >= new length + 2 + ESC_MARGIN
+ESC_ENABLE = 1
+ESC_MAX_STEPS = 4
+ESC_MARGIN = 0

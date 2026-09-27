@@ -23,14 +23,19 @@ MSG_THREAT = 2
 MSG_KING = 3
 MSG_SPAWN = 4
 MSG_KING_RELAY = 6   # CASH2: a king beacon passed on by the dragon that heard it
+MSG_HUB = 5          # HUB RALLY: a food patch (value | contested << 8 | relay hops << 9 in the length field)
 
 king_beacons = {}
 king_lengths = {}  # Tracks {dragon_id: (round_seen, true_length)}
 king_relays = []    # CASH2: king beacons heard this turn, passed on once
 king_relayed = set()
+hub_beacons = {}    # HUB RALLY: patch tile -> (round heard, value, contested)
+hub_relays = []     # HUB RALLY: patch beacons heard this turn that we pass on once
+hub_relayed = set()
 # Only the last sonar sent in each direction is cast, so sends are queued per direction (highest
 # priority wins) and flush_sonar() casts them at the end of the turn.
 SONAR_KING, SONAR_RELAY, SONAR_BEACON = 3, 2, 1
+SONAR_RALLY = 1.5
 sonar_out = {}      # direction -> (priority, message)
 
 def process_sonar() -> None:
@@ -69,6 +74,16 @@ def process_sonar() -> None:
                 # Triggers the BFS spawn logic by injecting a default 30-round countdown
                 seen_round[idx] = rnd
                 ptime[idx] = timer
+            elif msg_type == MSG_HUB and RALLY_ENABLE:
+                value, contested, hops = sender_len & 0xFF, (sender_len >> 8) & 1, (sender_len >> 9) & 7
+                old = hub_beacons.get(idx)
+                if old is None or old[0] < rnd or value > old[1]:
+                    hub_beacons[idx] = (rnd, value, contested)
+                # A ray only reaches the first dragon on its line, so pass it on once
+                key = (idx, rnd // HUB_TTL)
+                if hops > 0 and key not in hub_relayed:
+                    hub_relayed.add(key)
+                    hub_relays.append((x, y, value | (contested << 8) | ((hops - 1) << 9)))
 
     # Clean up stale beacons (older than 10 rounds)
     for k in list(king_beacons.keys()):
@@ -77,6 +92,12 @@ def process_sonar() -> None:
 
     if len(king_relayed) > 256:
         king_relayed.clear()
+
+    for k in list(hub_beacons.keys()):
+        if rnd - hub_beacons[k][0] > HUB_TTL:
+            del hub_beacons[k]
+    if len(hub_relayed) > 256:
+        hub_relayed.clear()
 
     # Clean up stale ID lengths
     for k in list(king_lengths.keys()):
@@ -120,8 +141,10 @@ others = {}
 heads = {}
 seg_count = {}
 bodies = {}          # enemy id -> {idx: facing} for every visible segment (trap estimates)
-mates_near = set()   
+mates_near = set()
 mate_ids = set()
+vis_pearls = []      # HUB RALLY: pearl tiles in view this turn
+vis_soon = 0         # HUB RALLY: empty tiles in view spawning within HUB_SOON rounds
 visits = {}
 traj = []
 LAST_ROW = 0
@@ -211,7 +234,10 @@ def nbrs(idx):
     return out
 
 def observe():
+    global vis_soon
     rnd = game.get_round_num()
+    vis_pearls.clear()
+    soon = 0
     me = ct.get_id()
     my_team = ct.get_team()
     heads.clear()
@@ -228,8 +254,11 @@ def observe():
         ptime[idx] = t.get_pearl_time()
         if t.has_pearl():
             pearls[idx] = rnd
+            vis_pearls.append(idx)
         else:
             pearls.pop(idx, None)
+            if 0 <= ptime[idx] <= HUB_SOON:
+                soon += 1
         part = t.get_dragon()
         if part is not None and part.get_id() != me:
             others[idx] = rnd
@@ -270,6 +299,7 @@ def observe():
                 ends = portal_ends.setdefault(pid, [])
                 if (k, i) not in ends:
                     ends.append((k, i))
+    vis_soon = soon
 
 def build_blockers():
     rnd = game.get_round_num()
@@ -322,7 +352,7 @@ def room(start, extra_blocked, vacate, need):
             push((j, depth))
     return count
 
-def search(head, blocked, vacate, targets=(), claimed=(), targets2=()):
+def search(head, blocked, vacate, targets=(), claimed=(), targets2=(), vor=None):
     rnd = game.get_round_num()
     best = [0.0] * 4
     unknown = [0] * 4
@@ -369,6 +399,33 @@ def search(head, blocked, vacate, targets=(), claimed=(), targets2=()):
             pr = pearls.get(idx)
             if pr is not None:
                 v = (PEARL_W if pr == rnd else MEMORY_PEARL_W) / (1 + dist)
+                if vor is not None:
+                    # VORONOI: an enemy gets there first -> likely gone; about as soon -> take it now;
+                    # a teammate gets there first -> leave it to them
+                    # vor = (enemy, mate, enemy is a distance map, mate is a distance map); a list
+                    # means plain wrapped distance to those heads
+                    if vor[2]:
+                        e = vor[0].get(idx, 99)
+                    else:
+                        e = 99
+                        for h in vor[0]:
+                            dd = wdist(idx, h)
+                            if dd < e:
+                                e = dd
+                    if vor[3]:
+                        m = vor[1].get(idx, 99)
+                    else:
+                        m = 99
+                        for h in vor[1]:
+                            dd = wdist(idx, h)
+                            if dd < m:
+                                m = dd
+                    if e < dist:
+                        v *= VOR_LOST_MULT
+                    elif e <= dist + VOR_WINDOW:
+                        v *= VOR_CONTEST_MULT
+                    if m < dist:
+                        v *= VOR_MATE_MULT
                 if v > best[first]:
                     best[first] = v
             pt = ptime[idx]
@@ -542,6 +599,144 @@ def sprint_attack():
         ct.make_moves(path)
     return True
 
+def sprint_grab():
+    """SPRINT GRAB: sprint through a short chain of visible pearls when a visible enemy head would reach
+    one of them first (or at the same time) if we walked. x steps cost x - 1 segments and each pearl on
+    the way is +1, so only contested pearls make it worth it: each is +1 for us and -1 for them.
+    Returns True if sent."""
+    if not GRAB_ENABLE or not heads:
+        return False
+    length = ct.get_length()
+    reach = min(length - 1, GRAB_MAX_STEPS)
+    if reach < 2:
+        return False
+    rnd = game.get_round_num()
+    head = traj[-1]
+    ehs = [h for h, (en, _, _) in heads.items() if en]
+    if not ehs or min(wdist(head, h) for h in ehs) > GRAB_ENEMY_DIST:
+        return False
+    live = {i for i, r in pearls.items() if r == rnd and wdist(head, i) <= reach}
+    if not live:
+        return False
+    blocked, vacate = build_blockers()
+    # how soon an enemy head could walk onto each tile
+    edist = {h: 0 for h in ehs}
+    q = deque(ehs)
+    while q:
+        i = q.popleft()
+        dp = edist[i]
+        if dp >= reach:
+            continue
+        for j in nbrs(i):
+            if j in edist or j in vacate:
+                continue
+            edist[j] = dp + 1
+            q.append(j)
+    if not any(edist.get(i, 99) <= reach for i in live):
+        return False
+    cut = ahead_tiles(False)
+    cands = []
+
+    def dfs(idx, dirs, tiles, p, c):
+        x = len(dirs)
+        if x >= 2 and idx in live and c >= 1:
+            score = 2 * c - (x - 1)
+            if p - (x - 1) >= GRAB_MIN_NET and score > 0:
+                cands.append((score, p, -x, list(dirs), list(tiles)))
+        if x >= reach:
+            return
+        for d in range(4):
+            j = step(idx, d)
+            if j < 0 or j == head or j in vacate or j in tiles or j in cut:
+                continue
+            t = x + 1
+            ate = j in live
+            dirs.append(d)
+            tiles.append(j)
+            dfs(j, dirs, tiles, p + ate, c + (ate and t >= 2 and edist.get(j, 99) <= t))
+            dirs.pop()
+            tiles.pop()
+
+    dfs(head, [], [], 0, 0)
+    if not cands:
+        return False
+    cands.sort(key=lambda z: z[:3], reverse=True)
+    pessimistic = cut | ahead_tiles(True) | around_heads()
+    for score, p, negx, dirs, tiles in cands[:6]:
+        end = tiles[-1]
+        # the enemy moves before our next turn: never finish next to its head
+        if any(j in heads and heads[j][0] for j in nbrs(end)):
+            continue
+        newlen = length + p + negx + 1
+        need = min(int(SPACE_LEN_MULT * newlen + SPACE_MARGIN), SPACE_CAP)
+        if room(end, pessimistic | set(tiles[:-1]), vacate, need) < need:
+            continue
+        ct.make_moves([DIRS[d] for d in dirs])
+        return True
+    return False
+
+def near_dist(srcs, depth, vacate):
+    """Multi-source walking distance (dragons and our body block) out to depth."""
+    out = {h: 0 for h in srcs}
+    q = deque(srcs)
+    while q:
+        i = q.popleft()
+        dp = out[i]
+        if dp >= depth:
+            continue
+        dp += 1
+        for j in nbrs(i):
+            if j in out or j in vacate:
+                continue
+            out[j] = dp
+            q.append(j)
+    return out
+
+def sprint_escape():
+    """SPRINT ESCAPE: the best normal move ends in a pocket too small to live in, so sprint (x steps
+    cost x - 1 segments) to the nearest tile, up to ESC_MAX_STEPS away, with room for our new length.
+    Intermediate tiles may pass enemy heads (they don't move during our sprint); the end tile may not.
+    Returns True if sent."""
+    length = ct.get_length()
+    reach = min(length - 1, ESC_MAX_STEPS)
+    if reach < 2:
+        return False
+    head = traj[-1]
+    blocked, vacate = build_blockers()
+    pessimistic = ahead_tiles(False) | ahead_tiles(True) | around_heads()
+    prev = {head: None}
+    q = deque([(head, 0)])
+    while q:
+        idx, dpt = q.popleft()
+        if dpt >= reach:
+            continue
+        for d in range(4):
+            j = step(idx, d)
+            if j < 0 or j in prev or not passable(j, dpt + 1, blocked, vacate):
+                continue
+            prev[j] = (idx, d)
+            x = dpt + 1
+            q.append((j, x))
+            if x < 2 or j in pessimistic:
+                continue
+            path = set()
+            cur = idx
+            while cur != head:
+                path.add(cur)
+                cur = prev[cur][0]
+            need = length - (x - 1) + 2 + ESC_MARGIN
+            if room(j, pessimistic | path, vacate, need) < need:
+                continue
+            dirs = []
+            cur = j
+            while prev[cur] is not None:
+                cur, dd = prev[cur]
+                dirs.append(DIRS[dd])
+            dirs.reverse()
+            ct.make_moves(dirs)
+            return True
+    return False
+
 def enemy_vacate(eid, hidx, base):
     """base vacate map with this enemy's visible body freeing up tail-first as it moves."""
     segs = bodies.get(eid)
@@ -594,6 +789,36 @@ def portal_traffic_pen(head, d, claimed, rnd):
     if ek in claimed:
         return PORTAL_CLAIM_PEN
     return 0.0
+
+def dodge_danger(head):
+    """SPRINT DODGE: tiles each visible enemy head could reach in one sprint (visible length - 1 steps,
+    capped at DODGE_MAX_REACH, bodies block it), mapped to the shortest such enemy's visible length."""
+    rnd = game.get_round_num()
+    mybody = set(traj[-ct.get_length():])
+    out = {}
+    for h, (en, eid, _) in heads.items():
+        if not en:
+            continue
+        le = seg_count.get(eid, 0)
+        reach = min(le - 1, DODGE_MAX_REACH)
+        if reach < 1 or wdist(head, h) > reach + 1:
+            continue
+        seen = {h}
+        q = deque([(h, 0)])
+        while q:
+            i, dp = q.popleft()
+            if dp >= reach:
+                continue
+            for j in nbrs(i):
+                if j in seen:
+                    continue
+                seen.add(j)
+                if j in mybody or rnd - others.get(j, -99) <= OTHER_TTL:
+                    continue
+                if le < out.get(j, 1 << 30):
+                    out[j] = le
+                q.append((j, dp + 1))
+    return out
 
 def corridor_pen(j, head, vacate):
     free = 0
@@ -749,7 +974,10 @@ def cash_target(length, rnd, king):
                 
     return best
 
+chosen_room = 1 << 30   # SPRINT ESCAPE: room() behind the move choose() picked
+
 def choose():
+    global chosen_room
     head = traj[-1]
     length = ct.get_length()
     units = ct.get_unit_count()
@@ -807,9 +1035,33 @@ def choose():
                 d_val = wdist(head, b_idx)
                 if csum is None or d_val < csum[1]:
                     csum = (b_idx, d_val)
-    sum_zone = (set(nbrs(csum[0])) | {csum[0]}) if csum else ()
-    pearl_val, unknown, hunt_dist, sum_dist = search(head, blocked, vacate, intercepts, no_pull, sum_zone)
-    sum_min = min(sum_dist) if csum else (1 << 20)
+    # HUB RALLY: head for a food patch a teammate announced (harder if it is contested), unless we are
+    # already on food, are the king, or are answering a cash-in summons (both use search's targets2)
+    hub_t = None
+    if RALLY_ENABLE and hub_beacons and csum is None and len(vis_pearls) + 0.5 * vis_soon < HUB_MIN_SCORE \
+            and not is_king(length, rnd):
+        for b, (br, bv, bc) in hub_beacons.items():
+            d0 = wdist(head, b)
+            if d0 <= 2 or d0 > HUB_RANGE:
+                continue
+            val = (HUB_RALLY_W if bc else HUB_W) * bv / (bv + 8.0) / (1.0 + d0 / 8.0)
+            if hub_t is None or val > hub_t[0]:
+                hub_t = (val, b, d0)
+    sum_zone = (set(nbrs(csum[0])) | {csum[0]}) if csum else ((set(nbrs(hub_t[1])) | {hub_t[1]}) if hub_t else ())
+    vor = None
+    # a dragon's first turn also pays for process start-up, so it skips Voronoi (VOR_SKIP_FIRST)
+    if VOR_ENABLE and heads and not (VOR_SKIP_FIRST and rnd == birth_round):
+        eh = [h for h, (en, _, _) in heads.items() if en]
+        mh = [h for h, (en, _, _) in heads.items() if not en]
+        if VOR_LITE == 1:
+            vor = (eh, mh, False, False)
+        elif VOR_LITE == 2:
+            # walls matter most for who reaches a pearl first; few enemy heads are ever in view
+            vor = (near_dist(eh, VOR_EDEPTH, vacate) if eh else {}, mh, True, False)
+        else:
+            vor = (near_dist(eh, VOR_DEPTH, vacate), near_dist(mh, VOR_DEPTH, vacate), True, True)
+    pearl_val, unknown, hunt_dist, sum_dist = search(head, blocked, vacate, intercepts, no_pull, sum_zone, vor)
+    sum_min = min(sum_dist) if (csum or hub_t) else (1 << 20)
 
     king = is_king(length, rnd)
     cking = CASH2_ENABLE and is_cash_king(length, rnd)
@@ -830,6 +1082,7 @@ def choose():
     ctgt = cash_target(length, rnd, king)
     traps = trap_setup(head, vacate) if (TRAP_ENABLE and not king and heads) else ()
 
+    danger = dodge_danger(head) if (DODGE_ENABLE and heads) else {}
     cut = ahead_tiles(False)
     pessimistic = cut | ahead_tiles(True) | around_heads()
 
@@ -856,7 +1109,7 @@ def choose():
                     summon_dist = d_val
                     active_summon = b_idx
 
-    best_d, best_s = None, -1e18
+    best_d, best_s, best_r = None, -1e18, 1 << 30
     for d in range(4):
         j = step(head, d)
         if j == -1:
@@ -900,6 +1153,14 @@ def choose():
                         s += CASH_W / (1.0 + sum_dist[d] - sum_min)
                 elif wdist(j, csum[0]) < csum[1]:
                     s += CASH_W
+
+            # HUB RALLY: by real path if the search reached the patch, else straight-line progress
+            if hub_t is not None:
+                if sum_min < (1 << 20):
+                    if sum_dist[d] < (1 << 20):
+                        s += hub_t[0] / (1.0 + sum_dist[d] - sum_min)
+                elif wdist(j, hub_t[1]) < hub_t[2]:
+                    s += hub_t[0]
 
             # Portal Traversal Logic
             if j != nb(head, d):
@@ -955,6 +1216,12 @@ def choose():
                     s += HUNT_ADJ_W
                 else:
                     s -= head_risk
+            # SPRINT DODGE: an enemy can sprint up to (its length - 1) tiles into our head; stay out of
+            # reach when that head-on would be a bad trade (we are longer, or we are the king)
+            if danger:
+                le = danger.get(j)
+                if le is not None and (length > le or king):
+                    s -= DODGE_PEN * (2.0 if king else 1.0)
 
             if j in cut: s -= TEAM_CUT_PEN
             if mates_near: s -= dynamic_team_pen * mates_within2(j)
@@ -985,6 +1252,8 @@ def choose():
         
         if s > best_s:
             best_s, best_d = s, d
+            best_r = r if j != -2 else (1 << 30)
+    chosen_room = best_r
     return best_d
 
 def unit_cap():
@@ -1062,6 +1331,31 @@ def maybe_split():
     splits_done += 1
     return True
 
+def hub_broadcast():
+    """HUB RALLY: announce a live food patch; always (as a rally) when an enemy head is in view."""
+    score = len(vis_pearls) + 0.5 * vis_soon
+    if score < HUB_MIN_SCORE:
+        return
+    contested = any(en for en, _, _ in heads.values())
+    if not contested and (not RALLY_UNCONTESTED or rng.random() >= HUB_PING_PROB):
+        return
+    # Centre of the patch: the pearl with the most other pearls within 2 tiles
+    # (only the first 16 pearls are candidates, to bound the cost in pearl-dense views)
+    best, bc = traj[-1], -1
+    for i in vis_pearls[:16]:
+        ix, iy = i % WID, i // WID
+        c = 0
+        for k in vis_pearls:
+            dx = abs(k % WID - ix)
+            dy = abs(k // WID - iy)
+            if min(dx, WID - dx) <= 2 and min(dy, HEI - dy) <= 2:
+                c += 1
+        if c > bc:
+            best, bc = i, c
+    value = min(255, int(2 * score))
+    send_encrypted_sonar(best % WID, best // WID, MSG_HUB, length=value | (int(contested) << 8) | (HUB_RELAY_HOPS << 9),
+                         priority=SONAR_RALLY if contested else SONAR_BEACON)
+
 def any_safe():
     head = traj[-1]
     blocked, vacate = build_blockers()
@@ -1097,6 +1391,13 @@ def execute_turn():
         
     observe()
     process_sonar()
+
+    if RALLY_ENABLE:
+        if hub_relays:
+            rx, ry, payload = hub_relays[0]
+            send_encrypted_sonar(rx, ry, MSG_HUB, length=payload, priority=SONAR_RELAY)
+            hub_relays.clear()
+        hub_broadcast()
 
     if SPAWN_SONAR_ENABLE:
         # SPAWN CLUSTER BROADCAST: Announce rich, renewable food hubs
@@ -1138,6 +1439,8 @@ def execute_turn():
     
     if sprint_attack():
         return
+    if sprint_grab():
+        return
     if maybe_split():
         return
     if CASH_ENABLE:
@@ -1155,6 +1458,8 @@ def execute_turn():
                 return  # no action -> engine suicide; pearls drop near the superior dragon
         
     d = choose()
+    if ESC_ENABLE and (d is None or chosen_room < ct.get_length() + 2) and sprint_escape():
+        return
     
     # Restored Emergency Escape Split from main_6.py
     if d is None:
