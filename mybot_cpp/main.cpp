@@ -1126,6 +1126,9 @@ static int choose() {
         }
     }
 
+    // POCKET PORTALS: are we inside a small walled cell (portals count as walls)?
+    bool const head_in_cell = (POCKET_PORTAL_PEN > 0 || POCKET_EXIT_FREE) && pocket_size(head, POCKET_CELL_SIZE) < POCKET_CELL_SIZE;
+
     int best_d = -1;
     double best_s = -1e18;
     for (int d = 0; d < 4; d++) {
@@ -1158,7 +1161,8 @@ static int choose() {
                 s = -(PORTAL_UNKNOWN_PEN * curiosity_factor * pmult) + rng.random();
             }
             if (endgame) s -= ENDGAME_PORTAL_PEN * pmult;
-            s -= portal_traffic_pen(head, d, ts_claimed, rnd);
+            // POCKET_EXIT_FREE: from inside a cell the portal may be the only way out, so no traffic penalty
+            if (!(POCKET_EXIT_FREE && head_in_cell)) s -= portal_traffic_pen(head, d, ts_claimed, rnd);
         } else {
             // Mandatory survival check MUST happen before hunting
             if (!passable(j, 1, vacate)) continue;
@@ -1181,7 +1185,10 @@ static int choose() {
 
             // Portal Traversal Logic
             if (j != nb(head, d)) {
-                s -= portal_traffic_pen(head, d, ts_claimed, rnd);
+                if (!(POCKET_EXIT_FREE && head_in_cell)) s -= portal_traffic_pen(head, d, ts_claimed, rnd);
+                // POCKET_PORTAL_PEN: a known portal into a small walled cell (e.g. default's middle maze) costs
+                // extra, so dragons farm the open corridors instead of piling into the cells
+                if (POCKET_PORTAL_PEN > 0 && pocket_size(j, POCKET_CELL_SIZE) < POCKET_CELL_SIZE) s -= POCKET_PORTAL_PEN;
                 // Known portals (both ends seen) cost KNOWN_PORTAL_PEN, less than the old PORTAL_PEN
                 double raw_pen = KNOWN_PORTAL_PEN * pmult;
                 if (endgame) raw_pen += ENDGAME_PORTAL_PEN * pmult;
@@ -1265,6 +1272,22 @@ static int unit_cap() {
     return std::min(cap, game->get_unit_limit() - UNIT_RESERVE);
 }
 
+// CHILD ROOM: a split child's head is our tail tip, facing back along our path. True if it has a free tile there with
+// CHILD_ROOM_NEED room (false when a teammate follows us down a corridor or a dead end is behind: the child would die)
+static bool child_can_escape() {
+    int const L = ct->get_length();
+    std::vector<int> const body = my_body(L);
+    if (static_cast<int>(body.size()) < L || body.size() < 2) return true;
+    std::vector<int> const vacate = build_blockers();
+    int const tip = body[0], neck = body[1];
+    for (int d = 0; d < 4; d++) {
+        int const t = step(tip, d);
+        if (t < 0 || t == neck || !passable(t, 1, vacate)) continue;
+        if (room(t, {tip}, vacate, CHILD_ROOM_NEED) >= CHILD_ROOM_NEED) return true;
+    }
+    return false;
+}
+
 static bool maybe_split() {
     int const length = ct->get_length();
     int const units = ct->get_unit_count();
@@ -1281,6 +1304,7 @@ static bool maybe_split() {
         // If the local room has fewer than 20 open tiles, abort reproduction
         if (room(traj.back(), {}, vacate, 20) < 20) return false;
     }
+    if (CHILD_ROOM && !child_can_escape()) return false;
 
     // 1. Dynamic Hard Cap (from Version 2)
     if (units >= unit_cap()) return false;
@@ -1330,11 +1354,38 @@ static bool maybe_split() {
     return true;
 }
 
+// DOOM NO RAM: with no safe move, ram an adjacent enemy head (both die), else an unknown portal, else die alone
+// (wall / body) or return -1 (no action = suicide) rather than step into a teammate's head, which kills both
+static int doomed_move() {
+    int const head = traj.back();
+    auto const my_team = ct->get_team();
+    int nbr[4], kind[4] = {0, 0, 0, 0};  // kind 1 = enemy head, 2 = teammate head
+    for (int d = 0; d < 4; d++) nbr[d] = step(head, d);
+    for (auto const& t : ct->get_tiles()) {
+        auto const* part = t.get_dragon();
+        if (part == nullptr || !part->is_head() || part->get_id() == ct->get_id()) continue;
+        auto const p = t.get_position();
+        int const i = p.y * WID + p.x;
+        for (int d = 0; d < 4; d++)
+            if (nbr[d] == i) kind[d] = part->get_team() == my_team ? 2 : 1;
+    }
+    for (int d = 0; d < 4; d++)
+        if (kind[d] == 1) return d;
+    for (int d = 0; d < 4; d++)
+        if (nbr[d] == -2) return d;
+    int const f = dir_of(ct->get_dir());
+    if (kind[f] != 2) return f;
+    for (int d = 0; d < 4; d++)
+        if (kind[d] != 2 && d != (f + 2) % 4) return d;
+    return -1;
+}
+
 static int any_safe() {
     int const head = traj.back();
     std::vector<int> const vacate = build_blockers();
     for (int d = 0; d < 4; d++)
         if (passable(step(head, d), 1, vacate)) return d;
+    if (DOOM_NO_RAM) return doomed_move();
     for (int d = 0; d < 4; d++)
         if (step(head, d) == -2) return d;
     return dir_of(ct->get_dir());
@@ -1505,6 +1556,7 @@ static void execute_turn() {
             return;
         }
         d = any_safe();
+        if (d < 0) return;  // DOOM_NO_RAM: die alone
     }
     ct->make_move(DIRS[d]);
 }
@@ -1534,7 +1586,8 @@ int main() {
                 traj.push_back(p.y * WID + p.x);
             }
             ct->output_log("error:", exc.what());
-            ct->make_move(DIRS[any_safe()]);
+            int const d = any_safe();
+            if (d >= 0) ct->make_move(DIRS[d]);
         }
         unswbc::end_turn();
     }

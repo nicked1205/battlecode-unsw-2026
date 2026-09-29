@@ -68,9 +68,20 @@ constexpr int PORTAL_AGE_RAMP = 1;
 // PORTAL LENGTH FEAR: 1 = the unexplored-portal penalty ramps with length instead of game time / age:
 // none at length <= PORTAL_FEAR_MIN_LEN, full (PORTAL_UNKNOWN_PEN) from PORTAL_FEAR_FULL_LEN (0 = old ramp,
 // which uses PORTAL_AGE_RAMP). 2 -> 5 won 97/175 vs the old ramp on the 11 portal maps; 3 -> 10 lost 38/88.
+// 1 -> 5 (length-2 dragons fear a little too; replays: most portals-map wall deaths are length 2-3 dragons in
+// portal pockets): 46/80 and 43/80 vs 2 -> 5, portals 7/8 and 8/8.
 constexpr int PORTAL_LEN_FEAR = 1;
-constexpr int PORTAL_FEAR_MIN_LEN = 2;
+constexpr int PORTAL_FEAR_MIN_LEN = 1;
 constexpr int PORTAL_FEAR_FULL_LEN = 5;
+// POCKET PORTALS: a cell is a walled-off area (kelp and portals count as walls) under POCKET_CELL_SIZE tiles.
+// A known portal into a cell costs POCKET_PORTAL_PEN extra (0 = off); POCKET_EXIT_FREE = 1 drops the
+// portal-traffic penalties while we are inside a cell, so we can always leave. Replays: on default we spent 42-65%
+// of turns in the middle maze vs the dev team's 15-22%. vs the previous bot on the 10 online maps: 44/80 and
+// 43/80 on fresh seeds (default 5/8, 6/8); vs a portal-avoiding bot 49/80 vs 50/80 without it.
+// Turned off 2026-09-28: did not do well online (was POCKET_PORTAL_PEN 30.0, POCKET_EXIT_FREE 1).
+constexpr double POCKET_PORTAL_PEN = 0.0;
+constexpr int POCKET_EXIT_FREE = 0;
+constexpr int POCKET_CELL_SIZE = 40;
 constexpr int PORTAL_TRAFFIC_ENABLE = 1;
 constexpr int PORTAL_TAKEN_TTL = 60;
 constexpr double PORTAL_TAKEN_PEN = 60.0;
@@ -202,3 +213,13 @@ constexpr int S_BIRTH_MAX_LEN = 4;
 // lost trauma 4/30 vs S_BIRTH off (it stalls splitting at the 1-wide fountain strips); with it 16/30.
 constexpr int S_BIRTH_POCKET_ONLY = 1;
 constexpr int S_BIRTH_POCKET_SIZE = 40;
+// DOOM NO RAM: a dragon with no safe move (too short for the emergency split) rams an adjacent enemy head, else takes
+// an unknown portal, else dies alone, instead of walking into a teammate's head (the old fallback kept going
+// forward). Replays: 1,280 teammate head-ons in 110 games (devil 43/game, dev team 0; portals 41, trauma 8).
+constexpr int DOOM_NO_RAM = 1;
+// CHILD ROOM: no split unless the child (born at our tail tip, facing back along our path) has a free tile with
+// CHILD_ROOM_NEED room; otherwise it is born facing a following teammate's head or a dead end and dies at once.
+// DOOM_NO_RAM + CHILD_ROOM + PORTAL_FEAR_MIN_LEN 1 (lab, with pocket portals on): 47/80 vs the lab on fresh seeds;
+// vs a portal-avoiding bot 60/80 where the bot without them scored 51/80.
+constexpr int CHILD_ROOM = 1;
+constexpr int CHILD_ROOM_NEED = 6;
