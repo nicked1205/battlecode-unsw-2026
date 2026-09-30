@@ -1,20 +1,27 @@
 #!/bin/bash
 
-botA="mybot_cpp_arch4/"
+botA="bot_merged/"
 botB="mybot_cpp_arch4.2/"
 
-seeds=(3001 3002 3003 3004 3005 3006 3007 3008 3009 3010 3011 3012 3013 3014 3015 3016 3017 3018 3019 3020)
+seeds=(3001 3002 3003 3004 3005 3006 3007 3008 3009 3010)
 
 botA_wins=0
 botB_wins=0
 games=0
 
 maps=(
+    "maps/dilemma.map"
     "maps/queen_of_spades.map"
+    "maps/default.map"
 )
 
 for map in "${maps[@]}"; do
     echo "Processing $map"
+
+    # Per-map statistics
+    map_botA_wins=0
+    map_botB_wins=0
+    map_games=0
 
     for seed in "${seeds[@]}"; do
 
@@ -33,6 +40,7 @@ for map in "${maps[@]}"; do
                 2>&1)
 
             games=$((games + 1))
+            map_games=$((map_games + 1))
 
             # Team A = first bot
             # Team B = second bot
@@ -50,8 +58,10 @@ for map in "${maps[@]}"; do
 
                 if [[ "$winning_bot" == "$botA" ]]; then
                     botA_wins=$((botA_wins + 1))
+                    map_botA_wins=$((map_botA_wins + 1))
                 else
                     botB_wins=$((botB_wins + 1))
+                    map_botB_wins=$((map_botB_wins + 1))
                 fi
 
             else
@@ -61,9 +71,24 @@ for map in "${maps[@]}"; do
 
         done
     done
+
+    # Map summary
+    echo
+    echo "========================================"
+    echo "Map: $map"
+    echo "Games: $map_games"
+    echo "$botA wins: $map_botA_wins"
+    echo "$botB wins: $map_botB_wins"
+    echo "========================================"
+    echo
 done
 
+# Overall summary
 echo
+echo "========================================"
+echo "OVERALL RESULTS"
+echo "========================================"
 echo "Games run: $games"
 echo "$botA wins: $botA_wins"
 echo "$botB wins: $botB_wins"
+echo "========================================"
