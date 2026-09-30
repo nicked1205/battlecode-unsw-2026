@@ -243,6 +243,13 @@ constexpr double DODGE_PEN = 30.0;
 constexpr int TACT_EXITS = 0;
 constexpr double TACT_CORNER_PEN = 40.0;
 constexpr double TACT_ONE_EXIT_PEN = 10.0;
+// ===== ARCH4.1 (2026-09-30): mybot_cpp_arch4 + POCKET RULE =====
+// = mybot_cpp_arch4 with the pocket rule from mybot_cpp_arch4_lab (DE_NET + DE_NET_SPAWN): a move into a no-loop pocket costs
+// DE_NET_PEN unless one branch in holds DE_NET_MINP+ pearls (fresh, or due by the time the head gets there). Lab vs arch4:
+// 81/160 overall, queen_of_spades 11/16, portals 5/16, dilemma unchanged.
+constexpr int DE_NET_MINP = 3;
+constexpr int DE_NET_FRESH = 2;
+constexpr double DE_NET_PEN = 200.0;
 // ===== ARCH4 TEST VERSION (2026-09-29): mybot_cpp_arch3 + fountain dead-end entry while pearls lie there =====
 // = mybot_cpp_arch3 (incl. PORTAL_TAKEN_PEN 20.0) with arch2's dead-end fountain entry back (FARM_DE_LEN 3) but only while
 // pearls lie in the dead end right now (FARM_DE_MINP 1), next to arch3's profit-checked entry (DE_PROFIT). Lab (with
@@ -273,69 +280,3 @@ constexpr int DE_PROFIT_MAX_LEN = 8;
 // king heard by sonar within KING2_SILENCE rounds, and a self-election is only blocked by longer kings. Lab (own sonar keys,
 // no self-play cross-talk): 45/80, 43/80 fresh seeds, 43/80 pearl-variant maps vs mybot_cpp_arch (131/240)
 constexpr int KING2_SILENCE = 10;
-// ===== ARCH4 LAB (2026-09-30): arch4 + new switches (all 0 = mybot_cpp_arch4) =====
-// DE_SAFE: a dragon under length 4 cannot emergency-split, so at the end of a no-loop pocket (dead_end()) it dies. It pays
-// DE_SAFE_PEN for a move into one unless the pearls on one branch in (seen in the last DE_FRESH rounds) get it to length 4.
-// The dead-end entries (FARM_DE_LEN, DE_PROFIT) also only count pearls seen in the last DE_FRESH rounds, and FARM_DE_LEN needs
-// enough of them to reach length 4 (a 2-long dragon + 1 pearl used to walk in and die at length 3).
-constexpr int DE_SAFE = 0;
-constexpr int DE_FRESH = 2;
-constexpr double DE_SAFE_PEN = 200.0;
-// DE_NET: any dragon pays DE_SAFE_PEN for a move into a no-loop pocket (dead_end()) unless one branch in holds DE_NET_MINP+
-// fresh pearls: the head dies at its end (2 segments and a unit at length 4+, the whole dragon below), so fewer is a loss.
-// Overrides the FARM_DE_LEN / DE_PROFIT entries. DE_SAFE 1 was 76/160 vs arch4 (only for dragons under length 4).
-constexpr int DE_NET = 1;
-constexpr int DE_NET_MINP = 3;
-// DE_NET_SPAWN: pearls due to spawn by the time the head gets there count too (DE_NET alone: 71/160, dilemma 0/16, queen 11/16)
-constexpr int DE_NET_SPAWN = 1;
-// SONAR_KEY_SALT: 0 = the normal key; any other value gives this build its own sonar key (lab: removes self-play cross-talk)
-constexpr int SONAR_KEY_SALT = 1;
-// FARMER: one dragon farms a walled fountain chamber (the walled-off area around its head, kelp and portals count as walls, of
-// FARMER_CELL_MIN..FARMER_CELL_MAX tiles, all seen, with a loop and FARMER_MIN_TILES+ spawn tiles whose countdown was never seen
-// above FARMER_T, and a portal door). The farmer is the longest of our dragons inside (length FARMER_MIN_LEN+): it pays
-// FARMER_STAY_PEN to go through a portal, has no revisit penalty, only needs room for length + FARMER_ROOM_SLACK, and from
-// FARMER_SPLIT_AT only splits off a 2-long child whose head (our tail tip) is within FARMER_CHILD_REACH steps of the door.
-// The others in a farmed chamber get FARMER_LEAVE_W for going out (FARMER_LEAVE_W / (2 + steps to the door) inside).
-// Queen of spades replays: ~60 heads a game died in the chamber's 1-tile pockets, the chamber crowded with our dragons.
-constexpr int FARMER = 1;
-constexpr int FARMER_CELL_MIN = 8;
-constexpr int FARMER_CELL_MAX = 30;
-constexpr int FARMER_T = 60;
-constexpr int FARMER_MIN_TILES = 6;
-constexpr int FARMER_MIN_LEN = 2;
-constexpr int FARMER_SPLIT_AT = 4;
-constexpr int FARMER_CHILD_REACH = 2;
-constexpr int FARMER_ROOM_SLACK = 3;
-constexpr double FARMER_STAY_PEN = 300.0;
-constexpr double FARMER_LEAVE_W = 150.0;
-// FARMER_CHILD_TTL: for this many rounds after birth, unseen tiles count as chamber tiles (a child has only seen its first
-// view) and a dragon under FARMER_MIN_LEN in a chamber leaves. FARMER_MEMO: a dragon that saw it is not the farmer keeps
-// leaving for this many rounds (the farmer is often out of view in a 6-wide chamber).
-constexpr int FARMER_CHILD_TTL = 8;
-constexpr int FARMER_MEMO = 10;  // 30 kept the others leaving long after the farmer had died or left
-// FARMER_PLAN: instead of a 2-long child within FARMER_CHILD_REACH of the door, split off the largest child (we keep
-// FARMER_KEEP) that can walk out of the door within FARMER_CHILD_MAX steps without meeting us (in a ring our tail tip, the
-// child's head, lies just ahead of our own head), while we keep FARMER_ROOM_SLACK spare room in the chamber and stay off its
-// path until it has passed
-constexpr int FARMER_PLAN = 1;
-constexpr int FARMER_KEEP = 2;
-constexpr int FARMER_CHILD_MAX = 6;
-// FARMER_PLAN_SMALL: FARMER_PLAN picks the smallest child that passes its checks instead of the largest (largest: 10/24 on
-// queen vs the lab without FARMER)
-constexpr int FARMER_PLAN_SMALL = 1;
-// FARMER_MAX_LEN: longer dragons in a chamber do not farm it but leave (0 = no limit)
-constexpr int FARMER_MAX_LEN = 8;
-// FARMER_BLOCKED_EXTRA: steps added to the plain door distance when bodies block every way to the door right now
-constexpr int FARMER_BLOCKED_EXTRA = 3;
-// FARMER_DOOR2: only 2-long dragons go through a chamber door (out of our chamber, or into one whose far side we have seen).
-// A dragon of 4+ that chooses the door splits there instead: its 2-long head goes through next turn, the rest stays on this
-// side (inside it farms if there is no farmer, else leaves the same way later). A dragon of 3 (or at the unit cap) pays
-// FARMER_DOOR_PEN for the door. The farmer only splits off 2-long children, and only 2-long newborns are sent out.
-constexpr int FARMER_DOOR2 = 1;
-constexpr double FARMER_DOOR_PEN = 500.0;
-// FARMER_DOOR2_OUT3: 3-long dragons may go out of a chamber door too (still not in)
-constexpr int FARMER_DOOR2_OUT3 = 1;
-// FARMER_RESTARTS: a chamber's spawn tiles only count once seen respawning this many times (0 = old test)
-constexpr int FARMER_RESTARTS = 1;
-// FARMER_FAST_FRAC: a chamber's fountains must be at least this share of its spawn tiles (queen: all 16; default's cells ~20%)
-constexpr double FARMER_FAST_FRAC = 0.75;

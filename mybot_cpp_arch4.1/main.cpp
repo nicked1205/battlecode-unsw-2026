@@ -94,9 +94,7 @@ static PyRandom rng;
 // UPGRADED SONAR PROTOCOL
 // ==========================================
 // Payload structure: [8 bits X] [8 bits Y] [8 bits Type] [8 bits Signature]
-// SONAR_KEY_SALT (lab): a different key per build, so in self-play the two sides cannot read each other's messages (online
-// the other teams never can); the low byte changes, so foreign messages fail the signature check
-constexpr uint64_t SECRET_KEY = 0xAAAAAAAAAAAAAAAAULL ^ (static_cast<uint64_t>(SONAR_KEY_SALT) * 0x9E3779B97F4A7C15ULL);
+constexpr uint64_t SECRET_KEY = 0xAAAAAAAAAAAAAAAAULL;
 constexpr uint64_t SONAR_SIG = 0xAA;
 constexpr int MSG_PEARL = 1;
 constexpr int MSG_THREAT = 2;
@@ -473,9 +471,6 @@ static void self_trace() {
     if (!back.empty()) traj.insert(traj.begin(), back.rbegin(), back.rend());
 }
 
-// FARMER_PLAN: (tile, round it is free again) for our split child's planned walk out of the chamber
-static std::vector<std::pair<int, int>> reserved;
-
 // Tail-to-head list of our body tiles we know: traj[-L:]
 static std::vector<int> my_body(int L) {
     int const start = std::max(0, static_cast<int>(traj.size()) - L);
@@ -512,9 +507,6 @@ static std::vector<int> build_blockers() {
     for (int i : blocked) vacate[i] = 1 << 30;
     for (int idx = 0; idx < NT; idx++)
         if (others[idx] != NONE_R && rnd - others[idx] <= OTHER_TTL) vacate[idx] = 1 << 30;
-    // FARMER_PLAN: tiles on our child's planned walk out stay blocked until it has passed them
-    for (auto const& [t, until] : reserved)
-        if (until > rnd) vacate[t] = std::max(vacate[t], until - rnd + 1);
     return vacate;
 }
 
@@ -684,7 +676,6 @@ struct Hunt {
 
 static bool is_long(int length, int rnd);
 static bool is_cash_king(int length, int rnd);
-static int unit_cap();
 
 // Returns (prey tiles to step on, prey ids, intercept tiles to path toward, sprint targets)
 static Hunt hunt_prey(int length, int units, int rnd, bool has_mates, bool anchor) {
@@ -920,19 +911,15 @@ static bool dead_end(int j, int head) {
     return half / 2 <= nodes - 1;
 }
 
-// DE_SAFE: a pearl seen in the last DE_FRESH rounds (an older memory may have been eaten since)
-static bool fresh_pearl(int t, int rnd) { return pearls[t] != NONE_R && rnd - pearls[t] <= DE_FRESH; }
-
-// DE_SAFE: -1 if j is not in a dead_end() pocket, else the most fresh pearls the head can eat going in: the pocket is a
-// tree and a head that cannot turn around follows one branch, so the best root-to-node sum
-// DE_NET_SPAWN: a spawn tile also counts when its pearl is due by the time the head gets there (dilemma's fountain columns
-// refill every round: counting only the pearls lying there lost dilemma 0/16)
+// POCKET RULE: -1 if j is not in a dead_end() pocket, else the most pearls the head can eat going in. The pocket is a tree
+// and a head that cannot turn around follows one branch, so this is the best root-to-tile sum. A tile counts if a pearl was
+// seen there in the last DE_NET_FRESH rounds (older memories may have been eaten), or if it will have one by the time the
+// head gets there: its countdown was never seen above the steps to it (dilemma's every-round fountain columns), or its last
+// countdown runs out by then.
 static int dead_end_pearls(int j, int head, int rnd) {
     if (!dead_end(j, head)) return -1;
     auto const food = [&](int t, int depth) {
-        if (fresh_pearl(t, rnd)) return 1;
-        if (!DE_NET_SPAWN) return 0;
-        // a tile whose countdown was never seen above our arrival time has a pearl by then whenever we last saw it
+        if (pearls[t] != NONE_R && rnd - pearls[t] <= DE_NET_FRESH) return 1;
         if (maxpt[t] >= 0 && maxpt[t] <= depth) return 1;
         if (ptime[t] < 0 || seen_round[t] < 0) return 0;
         int const pred = ptime[t] - (rnd - seen_round[t]);
@@ -955,247 +942,6 @@ static int dead_end_pearls(int j, int head, int rnd) {
         }
     }
     return best;
-}
-
-// FARMER: one dragon farms a walled fountain chamber and sends 2-long children out of its door; the others leave. A chamber
-// is the walled-off area around our head (kelp and portals count as walls) of FARMER_CELL_MIN..FARMER_CELL_MAX tiles, all
-// seen, with a loop to circle in, FARMER_MIN_TILES+ spawn tiles whose countdown was never seen above FARMER_T and a portal
-// door (queen of spades: the 2x6 fountain block and the 1-tile pockets above it, portal between the middle two)
-static TileSet ts_cell;              // tiles of the chamber our head is in
-static std::vector<int> cell_doors;  // chamber tiles with a portal edge
-static std::vector<int> door_dist;   // steps to the nearest door inside the chamber (valid for ts_cell tiles)
-static bool in_chamber = false;      // our head is in a chamber
-static bool farmer = false;          // ... and we are its farmer: the longest of our dragons in it (ties: lower id)
-static bool farmed = false;          // ... and a longer teammate in it is the farmer
-
-static int farmed_until = -1;  // FARMER: we saw a longer teammate farming our chamber; keep leaving until this round
-
-// FARMER: is start in a chamber? Fills cell with its tiles and doors with its door tiles. allow_unseen: unseen tiles count
-// as chamber tiles we do not search past (a newborn has only seen its first view, narrower than the chamber)
-static bool find_chamber(int start, TileSet& cell_set, std::vector<int>& doors, bool allow_unseen) {
-    cell_set.clear();
-    doors.clear();
-    cell_set.add(start);
-    for (std::size_t qh = 0; qh < cell_set.items.size(); qh++) {
-        if (static_cast<int>(cell_set.items.size()) > FARMER_CELL_MAX) return false;
-        int const i = cell_set.items[qh];
-        if (seen_round[i] < 0) {
-            if (!allow_unseen) return false;
-            continue;
-        }
-        for (int d = 0; d < 4; d++)
-            if (edge_state(edge_key(i, d)) == 0) cell_set.add(nb(i, d));
-    }
-    std::vector<int> const& cell = cell_set.items;
-    int const n = static_cast<int>(cell.size());
-    if (n > FARMER_CELL_MAX || n < FARMER_CELL_MIN) return false;
-    int spawn = 0, any_spawn = 0, open_edges = 0;
-    for (int i : cell) {
-        if (seen_round[i] < 0) continue;
-        if (maxpt[i] >= 0) any_spawn++;
-        // FARMER_RESTARTS: a fountain was seen respawning, not just a slow tile we happened to see with a low countdown
-        // (default's maze cells passed as chambers without it); a newborn has no history yet
-        if (maxpt[i] >= 0 && maxpt[i] <= FARMER_T && (allow_unseen || pt_restarts[i] >= FARMER_RESTARTS)) spawn++;
-        bool door = false;
-        for (int d = 0; d < 4; d++) {
-            int const st = edge_state(edge_key(i, d));
-            if (st == 0 && cell_set.has(nb(i, d))) open_edges++;
-            else if (st == 2) door = true;
-        }
-        if (door) doors.push_back(i);
-    }
-    // each open edge was counted from both its tiles; a loop needs at least as many edges as tiles
-    // FARMER_FAST_FRAC: fountains make up most of the spawn tiles (default: every tile spawns, slowly; a newborn's first view
-    // catches some low countdowns there by chance)
-    return spawn >= FARMER_MIN_TILES && spawn >= FARMER_FAST_FRAC * any_spawn && !doors.empty() && open_edges / 2 >= n;
-}
-
-static TileSet ts_cell2;            // FARMER_DOOR2: scratch for the chamber test on a portal's far side
-static std::vector<int> cell_doors2;
-
-// FARMER_DOOR2: does moving d from head cross a chamber door (out of our chamber, or into a chamber we have seen)?
-static bool chamber_door_move(int head, int d) {
-    if (edge_state(edge_key(head, d)) != 2) return false;
-    if (in_chamber) return true;
-    int const j = step(head, d);
-    return j >= 0 && find_chamber(j, ts_cell2, cell_doors2, false);
-}
-
-// FARMER_DOOR2: only 2-long dragons go through a chamber door; a dragon of 4+ splits there first (see execute_turn), one of 3
-// cannot (a 1-long part is not allowed), nor can one at the unit cap
-static bool door2_ok(int head, int d, int length, int units) {
-    if (length == 2 || !chamber_door_move(head, d)) return true;
-    // FARMER_DOOR2_OUT3: a 3-long dragon may leave (a 2-long leaver that ate the door tile's pearl is 3 and stuck there;
-    // probe: the farmer was in trouble after 24% of 3-long exits vs 30% of 2-long ones)
-    if (FARMER_DOOR2_OUT3 && length == 3 && in_chamber) return true;
-    return length >= 4 && units < unit_cap();
-}
-
-static void farm_role() {
-    in_chamber = farmer = farmed = false;
-    ts_cell.clear();
-    cell_doors.clear();
-    if (!FARMER || traj.empty()) return;
-    int const rnd = rnd_now(), L = ct->get_length(), me = ct->get_id();
-    bool const newborn = birth_round > 0 && rnd - birth_round <= FARMER_CHILD_TTL;
-    if (!find_chamber(traj.back(), ts_cell, cell_doors, newborn)) return;
-    std::vector<int> const& cell = ts_cell.items;
-    in_chamber = true;
-    for (int i : cell) door_dist[i] = 1 << 20;
-    std::vector<int> q(cell_doors);
-    for (int i : cell_doors) door_dist[i] = 0;
-    for (std::size_t qh = 0; qh < q.size(); qh++) {
-        int const i = q[qh];
-        for (int d = 0; d < 4; d++) {
-            if (edge_state(edge_key(i, d)) != 0) continue;
-            int const j = nb(i, d);
-            if (door_dist[j] > door_dist[i] + 1) {
-                door_dist[j] = door_dist[i] + 1;
-                q.push_back(j);
-            }
-        }
-    }
-    for (auto const& h : heads) {
-        if (h.enemy || !ts_cell.has(h.idx)) continue;
-        int const ml = seg_of(h.pid);
-        // FARMER_PLAN: seniority, the oldest (lowest id) of our dragons of FARMER_MIN_LEN+ farms: its children are often
-        // longer than it after a big split, and must not take over. Otherwise the longest farms (ties: lower id).
-        // (only teammates that can farm count: one too long to circle is leaving itself)
-        bool const can_farm = ml >= FARMER_MIN_LEN && (FARMER_MAX_LEN == 0 || ml <= FARMER_MAX_LEN);
-        if (FARMER_PLAN ? (h.pid < me && can_farm) : (ml > L || (ml == L && h.pid < me))) farmed = true;
-    }
-    // a newborn in a chamber was split off by the farmer (or is in its way): it leaves (without FARMER_PLAN only when too
-    // short to farm). Being farmed is remembered for FARMER_MEMO rounds, the farmer is often out of view in its chamber
-    // FARMER_DOOR2: only a 2-long newborn leaves by this rule (a longer one is the tail a leaver left inside at the door)
-    if (newborn && (FARMER_DOOR2 ? L <= 2 : (FARMER_PLAN || L < FARMER_MIN_LEN))) farmed = true;
-    // FARMER_MAX_LEN: a dragon too long to circle the chamber (e.g. one that came in through the door, its body still
-    // trailing out) cannot farm it and would box itself in: it leaves too (probe: farmers of 6-20 emergency-split there)
-    if (FARMER_MAX_LEN > 0 && L > FARMER_MAX_LEN) farmed = true;
-    if (farmed) farmed_until = rnd + FARMER_MEMO;
-    else if (rnd <= farmed_until) farmed = true;
-    farmer = !farmed && L >= FARMER_MIN_LEN;
-}
-
-// FARMER: can a 2-long child born at our tail tip (its head there, its neck our next segment) reach a door within
-// FARMER_CHILD_REACH steps? Our other segments and other dragons block, as they free up.
-static bool farm_child_exits() {
-    int const L = ct->get_length();
-    std::vector<int> const body = my_body(L);
-    if (static_cast<int>(body.size()) < L || L < 4 || !ts_cell.has(body[0])) return false;
-    std::vector<int> const vacate = build_blockers();
-    std::vector<std::pair<int, int>> q{{body[0], 0}};
-    std::vector<int> seen{body[0], body[1]};
-    for (std::size_t qh = 0; qh < q.size(); qh++) {
-        auto const [i, dp] = q[qh];
-        if (door_dist[i] == 0) return true;
-        if (dp >= FARMER_CHILD_REACH) continue;
-        for (int d = 0; d < 4; d++) {
-            int const j = step(i, d);
-            if (j < 0 || !ts_cell.has(j) || contains(seen, j)) continue;
-            seen.push_back(j);
-            if (passable(j, dp + 1, vacate)) q.push_back({j, dp + 1});
-        }
-    }
-    return false;
-}
-
-// FARMER_PLAN: steps from j to a door through the chamber, entering a tile only once it is free (vacate depth); 1 << 20 if
-// the bodies in the way do not let us through
-static int door_steps(int j, std::vector<int> const& vacate) {
-    std::unordered_map<int, int> dist{{j, 0}};
-    std::vector<int> q{j};
-    for (std::size_t qh = 0; qh < q.size(); qh++) {
-        int const i = q[qh], n = dist[i];
-        if (door_dist[i] == 0) return n;
-        for (int d = 0; d < 4; d++) {
-            if (edge_state(edge_key(i, d)) != 0) continue;
-            int const t = nb(i, d);
-            if (!ts_cell.has(t) || dist.count(t) || !passable(t, n + 2, vacate)) continue;
-            dist[t] = n + 1;
-            q.push_back(t);
-        }
-    }
-    return 1 << 20;
-}
-
-// FARMER_PLAN: the child size k to split off (0 = none): the largest k (FARMER_PLAN_SMALL: smallest; we keep FARMER_KEEP) for which the child (our last k
-// segments, its head our tail tip, which in a ring lies just ahead of our own head) can walk out of the door within
-// FARMER_CHILD_MAX steps, and we still have room in the chamber while it does, keeping off its path until it has passed.
-// Timing: the child moves right after the split, then each round after us (it has the next id). out = (tile, round free).
-static int farm_plan_split(std::vector<std::pair<int, int>>& out) {
-    int const L = ct->get_length(), rnd = rnd_now(), M = VACATE_MARGIN;
-    std::vector<int> const body = my_body(L);  // tail tip first
-    if (static_cast<int>(body.size()) < L || !ts_cell.has(body[0])) return 0;
-    std::unordered_map<int, int> idx_of;
-    for (int i = 0; i < L; i++) idx_of[body[i]] = i;
-    auto const other_at = [&](int t) { return others[t] != NONE_R && rnd - others[t] <= OTHER_TTL; };
-    // FARMER_PLAN_SMALL: try the smallest child first (the farmer stays long and keeps eating), else the largest first
-    for (int kk = 0; kk <= L - FARMER_KEEP - 2; kk++) {
-        int const k = FARMER_PLAN_SMALL ? 2 + kk : L - FARMER_KEEP - kk;
-        if (FARMER_DOOR2 && k != 2) continue;  // FARMER_DOOR2: only 2-long dragons go through the door
-        if (!ct->can_split(k)) continue;
-        // can the child enter tile t on its move number n? Our body[k + i] frees tail first, one tile per move of ours, and
-        // we have made n - 1 moves by then; its own body[j] frees as it moves away
-        auto const child_free = [&](int t, int n) {
-            if (other_at(t)) return false;
-            auto const f = idx_of.find(t);
-            if (f == idx_of.end()) return true;
-            int const i = f->second;
-            return i >= k ? n >= (i - k) + 2 + M : n >= (k - i) + 1 + M;
-        };
-        std::unordered_map<int, std::pair<int, int>> prev;  // tile -> (previous tile, move number it is entered on)
-        prev[body[0]] = {-1, 0};
-        std::vector<int> q{body[0]};
-        int door = -1;
-        for (std::size_t qh = 0; qh < q.size() && door < 0; qh++) {
-            int const i = q[qh], n = prev[i].second;
-            if (door_dist[i] == 0) {
-                // the crossing: a portal edge whose far side is not held by a dragon
-                for (int d = 0; d < 4 && door < 0; d++) {
-                    if (edge_state(edge_key(i, d)) != 2) continue;
-                    int const e = step(i, d);
-                    if (e == -2 || (e >= 0 && !other_at(e))) door = i;
-                }
-                if (door >= 0) break;
-            }
-            if (n >= FARMER_CHILD_MAX) continue;
-            for (int d = 0; d < 4; d++) {
-                if (edge_state(edge_key(i, d)) != 0) continue;
-                int const j = nb(i, d);
-                if (!ts_cell.has(j) || prev.count(j) || !child_free(j, n + 1)) continue;
-                prev[j] = {i, n + 1};
-                q.push_back(j);
-            }
-        }
-        if (door < 0) continue;
-        std::vector<std::pair<int, int>> path;  // (tile, move number the child enters it on)
-        for (int c = door; c != body[0]; c = prev[c].first) path.emplace_back(c, prev[c].second);
-        // our room in the chamber meanwhile (portals excluded: the farmer does not leave): our body[k + i] frees at depth
-        // i + 2 + M, the child's start tile body[j] once it has moved k - j times, a path tile entered on move n once it
-        // has moved n + k times (its tail has left it)
-        std::vector<int> v(NT, 0);
-        for (int i = 0; i + k < L; i++) v[body[k + i]] = i + 2 + M;
-        for (int j = 0; j < k; j++) v[body[j]] = std::max(v[body[j]], k - j + M);
-        for (auto const& [t, n] : path) v[t] = std::max(v[t], n + k + M);
-        int const head = body[L - 1], need = (L - k) + FARMER_ROOM_SLACK;
-        std::unordered_map<int, int> seen{{head, 1}};
-        std::vector<int> rq{head};
-        for (std::size_t qh = 0; qh < rq.size() && static_cast<int>(rq.size()) < need; qh++) {
-            int const i = rq[qh], dp = seen[i] + 1;
-            for (int d = 0; d < 4; d++) {
-                if (edge_state(edge_key(i, d)) != 0) continue;
-                int const j = nb(i, d);
-                if (!ts_cell.has(j) || seen.count(j) || other_at(j) || dp < v[j]) continue;
-                seen[j] = dp;
-                rq.push_back(j);
-            }
-        }
-        if (static_cast<int>(rq.size()) < need) continue;
-        out.clear();
-        for (auto const& [t, n] : path) out.emplace_back(t, rnd + n + k + M);
-        return k;
-    }
-    return 0;
 }
 
 static bool is_long(int length, int rnd) {
@@ -1372,9 +1118,7 @@ static int choose() {
         head_risk *= LONG_SAFE_HEAD_MULT;
         margin *= LONG_SAFE_SPACE_MULT;
     }
-    int const need0 = std::min(static_cast<int>(SPACE_LEN_MULT * length + margin), SPACE_CAP);
-    // FARMER: the chamber is smaller than the usual margin, so the farmer only needs room for its body to circle
-    int const need = FARMER && farmer ? std::min(need0, length + FARMER_ROOM_SLACK) : need0;
+    int const need = std::min(static_cast<int>(SPACE_LEN_MULT * length + margin), SPACE_CAP);
 
     Hunt hp = hunt_prey(length, units, rnd, !mates_near.empty(), anchor || protect);
     ts_prey.clear();
@@ -1556,10 +1300,6 @@ static int choose() {
             if (endgame) s -= ENDGAME_PORTAL_PEN * pmult;
             // POCKET_EXIT_FREE: from inside a cell the portal may be the only way out, so no traffic penalty
             if (!(POCKET_EXIT_FREE && head_in_cell)) s -= portal_traffic_pen(head, d, ts_claimed, rnd);
-            // FARMER: the farmer stays in its chamber, the others go out of the door
-            if (FARMER && farmer) s -= FARMER_STAY_PEN;
-            if (FARMER && farmed) s += FARMER_LEAVE_W;
-            if (FARMER && FARMER_DOOR2 && !door2_ok(head, d, length, units)) s -= FARMER_DOOR_PEN;
         } else {
             // Mandatory survival check MUST happen before hunting
             if (!passable(j, 1, vacate)) continue;
@@ -1573,8 +1313,6 @@ static int choose() {
 
             if (ts_prey.has(j)) s = HUNT_KILL_W + rng.random();
             else s = pearl_val[d];
-            // FARMER_PLAN: a dragon leaving a farmed chamber leaves its pearls to the farmer (children circled eating them)
-            if (FARMER && FARMER_PLAN && farmed && ts_cell.has(j)) s = 0.0;
 
             // GLOBAL COMPASS: Pull small scouts toward the raycast beacon
             if (active_summon >= 0)
@@ -1602,17 +1340,6 @@ static int choose() {
                 double const dest_val = pearl_val[d] + (EXPLORE_W * unknown[d] / SEARCH_NODES);
                 double const elastic_pen = std::max(0.0, raw_pen - (dest_val * 0.5));
                 s -= elastic_pen;
-                if (FARMER && farmer) s -= FARMER_STAY_PEN;
-                if (FARMER && farmed) s += FARMER_LEAVE_W;
-                if (FARMER && FARMER_DOOR2 && !door2_ok(head, d, length, units)) s -= FARMER_DOOR_PEN;
-            } else if (FARMER && farmed && ts_cell.has(j)) {
-                // FARMER: a non-farmer in a farmed chamber heads for the door (the farmer's pearls stay for the farmer);
-                // FARMER_PLAN: by the steps it takes with the bodies in the way (tiles free once they have moved off)
-                int ds = FARMER_PLAN ? door_steps(j, vacate) : door_dist[j];
-                // a teammate's body (often the farmer's, in a 2-wide ring) counts as blocked for good, so with no way
-                // through right now fall back to the plain distance plus FARMER_BLOCKED_EXTRA: keep a pull toward the door
-                if (ds >= (1 << 20)) ds = door_dist[j] + FARMER_BLOCKED_EXTRA;
-                if (ds < (1 << 20)) s += FARMER_LEAVE_W / (2.0 + ds);
             }
 
             s -= corridor_pen(j, head, vacate);
@@ -1627,17 +1354,15 @@ static int choose() {
             // (in view or remembered, plus spawns due by the time its head gets there): it eats them and at the end
             // the emergency split sends the tail back out, losing the 2-long head (net DE_PROFIT_MIN - 2 or better)
             bool de_ok = false;
-            // DE_SAFE: only pearls seen in the last DE_FRESH rounds count (arch4: any pearl ever remembered there)
-            auto const de_pearl = [&](int t) { return DE_SAFE ? fresh_pearl(t, rnd) : pearls[t] != NONE_R; };
             int de_now = 0;  // pearls lying in the dead-end region right now
             if (farm_zone && length <= FARM_DE_LEN && r < need)
                 for (std::size_t q = 0; q + 1 < bfs_q.size(); q += 2)
-                    if (de_pearl(bfs_q[q])) de_now++;
+                    if (pearls[bfs_q[q]] != NONE_R) de_now++;
             if (r < need && length <= DE_PROFIT_MAX_LEN && !king && !cking) {
                 int P = 0;
                 for (std::size_t q = 0; q + 1 < bfs_q.size(); q += 2) {
                     int const t = bfs_q[q], dep = bfs_q[q + 1];
-                    if (de_pearl(t)) P++;
+                    if (pearls[t] != NONE_R) P++;
                     else if (ptime[t] >= 0 && seen_round[t] >= 0) {
                         int const pred = ptime[t] - (rnd - seen_round[t]);
                         if (0 <= pred && pred <= dep) P++;
@@ -1649,25 +1374,17 @@ static int choose() {
             // the stuck head eats and dies there, dropping pearls for the next one)
             // FARM_DE_MINP: only with pearls in the dead end right now, not a column the dragon ahead just emptied (arch2
             // online went 1/15 on dilemma: a conveyor of 3-long dragons dying at the ends of its fountain columns)
-            // DE_SAFE: and enough of them to reach length 4, so the emergency split can get the tail out at the end
-            int const de_minp = DE_SAFE ? std::max(FARM_DE_MINP, 4 - length) : FARM_DE_MINP;
-            if (farm_zone && length <= FARM_DE_LEN && de_now >= de_minp) de_ok = true;
+            if (farm_zone && length <= FARM_DE_LEN && de_now >= FARM_DE_MINP) de_ok = true;
             if (r < need && !de_ok) {
                 s -= (need - r) * TRAP_PEN;
                 if (r < length + 2) s -= LETHAL_PEN;
             }
-            // DE_SAFE: under length 4 there is no emergency split, so a no-loop pocket is certain death unless the fresh
-            // pearls on one branch in get us to 4 (whatever its size: the room check above counts tiles, not a way back)
-            if (DE_SAFE && length < 4) {
+            // POCKET RULE: at the end of a no-loop pocket the head dies whatever our length (at 4+ the emergency split leaves
+            // a 2-long head there, under 4 all of us), so going in only pays with DE_NET_MINP+ pearls on one branch. Overrides
+            // the FARM_DE_LEN / DE_PROFIT entries (queen replays: ~60 heads a game died in its 1-tile fountain pockets)
+            if (r < need) {
                 int const dp = dead_end_pearls(j, head, rnd);
-                if (dp >= 0 && length + dp < 4) s -= DE_SAFE_PEN;
-            }
-            // DE_NET: at the end of a no-loop pocket the head dies whatever our length (at 4+ the emergency split leaves a
-            // 2-long head there, under 4 all of us), so going in only pays with DE_NET_MINP+ fresh pearls on one branch
-            // (queen replays: 60 entries per game into its 1-tile fountain pockets, every head died there)
-            if (DE_NET && r < need) {
-                int const dp = dead_end_pearls(j, head, rnd);
-                if (dp >= 0 && dp < DE_NET_MINP) s -= DE_SAFE_PEN;
+                if (dp >= 0 && dp < DE_NET_MINP) s -= DE_NET_PEN;
             }
 
             // HUB CONTEST: body hits only kill the attacker, so wall enemy heads in instead of ramming
@@ -1713,8 +1430,7 @@ static int choose() {
             if (!mates_near.empty()) s -= dynamic_team_pen * mates_within2(j);
             s += (fast_now.empty() ? 1.0 : FARM_EXPLORE_MULT) * EXPLORE_W * unknown[d] / SEARCH_NODES;
             // FARM: no revisit penalty next to a fast spawn tile, so a dragon can circle a fountain
-            // FARMER: nor for the farmer, which circles its chamber
-            if (!farm_zone && !(FARMER && farmer)) s -= (j == nb(head, d) ? VISIT_PEN : VISIT_PEN * PORTAL_EXIT_VISIT_MULT) * visits[j];
+            if (!farm_zone) s -= (j == nb(head, d) ? VISIT_PEN : VISIT_PEN * PORTAL_EXIT_VISIT_MULT) * visits[j];
             if (d == facing) s += STRAIGHT_BONUS;
             if (!ehs.empty()) {
                 int const ed = edist[d];
@@ -1776,31 +1492,6 @@ static bool maybe_split() {
     int const length = ct->get_length();
     int const units = ct->get_unit_count();
     int const rnd = rnd_now();
-
-    // FARMER: the farmer keeps its length for farming and only splits off a 2-long child that can walk out of the door
-    // (the usual splits would leave the child in the far corner of the chamber, or be blocked there by S_BIRTH)
-    if (FARMER && farmer) {
-        if (length < FARMER_SPLIT_AT || units >= unit_cap()) return false;
-        if (FARMER_PLAN) {
-            // FARMER_PLAN: the child size that lets it walk out without meeting us, and keep off its path meanwhile
-            std::vector<std::pair<int, int>> path;
-            int const k = farm_plan_split(path);
-            if (k == 0) return false;
-            ct->do_split(k);
-            splits_done++;
-            reserved = std::move(path);
-            return true;
-        }
-        if (ct->can_split(2) && farm_child_exits()) {
-            ct->do_split(2);
-            splits_done++;
-            return true;
-        }
-        return false;
-    }
-    // FARMER: nobody else splits in a chamber: the child would be born away from the door and crowd the farmer's ring
-    // (probe: 26 such splits in 5 games, their children one more dragon to get out)
-    if (FARMER && in_chamber) return false;
 
     // Long dragons are exempt: blocking their splits in a corridor turns them into permanent gates that
     // box themselves in (doomed-head split every other round) and block our own routes
@@ -2001,13 +1692,12 @@ static void execute_turn() {
 
     observe();
     self_trace();
-    farm_role();
     process_sonar();
     if (ROLE_INDICATOR) {
         // ROLE LAYER: the role this dragon is playing, shown in the replay viewer
         int const L = ct->get_length();
         int const r = rnd_now();
-        char const* role = farmer ? "FARMER" : is_cash_king(L, r) ? "KING" : (is_anchor() || is_long(L, r)) ? "LONG" : "SCOUT";
+        char const* role = is_cash_king(L, r) ? "KING" : (is_anchor() || is_long(L, r)) ? "LONG" : "SCOUT";
         ct->set_indicator_string(std::string(role) + " " + std::to_string(L));
     }
 
@@ -2064,16 +1754,6 @@ static void execute_turn() {
 
     int d = choose();
 
-    // FARMER_DOOR2: a dragon longer than 2 splits at a chamber door: its 2-long head goes through next turn and the rest
-    // stays on this side (outside: a new dragon there; inside: it farms, or leaves the same way later)
-    if (FARMER && FARMER_DOOR2 && d >= 0) {
-        int const L = ct->get_length();
-        if (L >= 4 && ct->get_unit_count() < unit_cap() && ct->can_split(L - 2) && chamber_door_move(traj.back(), d)) {
-            ct->do_split(L - 2);
-            return;
-        }
-    }
-
     // Restored Emergency Escape Split from main_6.py
     if (d < 0) {
         int const current_len = ct->get_length();
@@ -2102,9 +1782,6 @@ int main() {
     setup();
     for (TileSet* t : {&ts_prey, &ts_inter, &ts_sumzone, &ts_cut, &ts_pess, &ts_enemy_ahead}) t->init(NT);
     ts_mybody.init(NT);
-    ts_cell.init(NT);
-    ts_cell2.init(NT);
-    door_dist.assign(NT, 1 << 20);
     ts_claimed.init(2 * NT);
     ts_nopull.init(2 * NT);
     rng.seed(static_cast<uint64_t>(ct->get_id()) * 7919 + 17);
